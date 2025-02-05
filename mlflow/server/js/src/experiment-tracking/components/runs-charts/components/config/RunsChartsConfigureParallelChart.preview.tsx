@@ -1,10 +1,12 @@
 import { RunsChartsRunData } from '../RunsCharts.common';
-import LazyParallelCoordinatesPlot, { processParallelCoordinateData } from '../charts/LazyParallelCoordinatesPlot';
+import LazyParallelCoordinatesPlot from '../charts/LazyParallelCoordinatesPlot';
+import { isParallelChartConfigured, processParallelCoordinateData } from '../../utils/parallelCoordinatesPlot.utils';
 import { useRunsChartsTooltip } from '../../hooks/useRunsChartsTooltip';
 import { RunsChartsParallelCardConfig } from '../../runs-charts.types';
-import { shouldEnableRunGrouping } from '../../../../../common/utils/FeatureUtils';
 import { useMemo } from 'react';
 import { FormattedMessage } from 'react-intl';
+import type { RunsGroupByConfig } from '../../../experiment-page/utils/experimentPage.group-row-utils';
+import { Empty, NoIcon } from '@databricks/design-system';
 
 export const RunsChartsConfigureParallelChartPreview = ({
   previewData,
@@ -13,12 +15,9 @@ export const RunsChartsConfigureParallelChartPreview = ({
 }: {
   previewData: RunsChartsRunData[];
   cardConfig: RunsChartsParallelCardConfig;
-  groupBy: string;
+  groupBy: RunsGroupByConfig | null;
 }) => {
-  const selectedParamsCount = cardConfig.selectedParams?.length || 0;
-  const selectedMetricsCount = cardConfig.selectedMetrics?.length || 0;
-
-  const isConfigured = selectedParamsCount + selectedMetricsCount >= 2;
+  const isConfigured = isParallelChartConfigured(cardConfig);
 
   const { setTooltip, resetTooltip } = useRunsChartsTooltip(cardConfig);
 
@@ -31,7 +30,7 @@ export const RunsChartsConfigureParallelChartPreview = ({
     [cardConfig.selectedParams, previewData],
   );
 
-  if (containsStringValues && groupBy && shouldEnableRunGrouping()) {
+  if (containsStringValues && groupBy) {
     return (
       <div css={{ display: 'flex', justifyContent: 'center', alignItems: 'center', textAlign: 'center' }}>
         <FormattedMessage
@@ -64,5 +63,15 @@ export const RunsChartsConfigureParallelChartPreview = ({
       onHover={setTooltip}
       onUnhover={resetTooltip}
     />
-  ) : null;
+  ) : (
+    <Empty
+      description={
+        <FormattedMessage
+          defaultMessage="No matching data found for the available runs."
+          description="Experiment tracking > runs charts > parallel coordinates chart preview > no data found description"
+        />
+      }
+      image={<NoIcon />}
+    />
+  );
 };

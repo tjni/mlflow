@@ -5,7 +5,6 @@ import sys
 import time
 import urllib
 from os.path import join
-from typing import List
 
 from mlflow.entities.model_registry import (
     ModelVersion,
@@ -39,6 +38,7 @@ from mlflow.store.model_registry import (
 from mlflow.store.model_registry.abstract_store import AbstractStore
 from mlflow.utils.file_utils import (
     contains_path_separator,
+    contains_percent,
     exists,
     find,
     is_directory,
@@ -77,6 +77,11 @@ def _validate_model_name(name):
     if contains_path_separator(name):
         raise MlflowException(
             f"Invalid name: '{name}'. Registered model name cannot contain path separator",
+            INVALID_PARAMETER_VALUE,
+        )
+    if contains_percent(name):
+        raise MlflowException(
+            f"Invalid name: '{name}'. Registered model name cannot contain '%' character",
             INVALID_PARAMETER_VALUE,
         )
 
@@ -401,7 +406,7 @@ class FileStore(AbstractStore):
             )
         return self._get_registered_model_from_path(model_path)
 
-    def get_latest_versions(self, name, stages=None) -> List[ModelVersion]:
+    def get_latest_versions(self, name, stages=None) -> list[ModelVersion]:
         """
         Latest version models for each requested stage. If no ``stages`` argument is provided,
         returns the latest version for each stage.
@@ -542,7 +547,7 @@ class FileStore(AbstractStore):
         tag_data = read_file(parent_path, tag_name)
         return ModelVersionTag(tag_name, tag_data)
 
-    def _get_model_version_tags_from_dir(self, directory) -> List[ModelVersionTag]:
+    def _get_model_version_tags_from_dir(self, directory) -> list[ModelVersionTag]:
         parent_path, tag_files = self._get_resource_files(directory, FileStore.TAGS_FOLDER_NAME)
         tags = []
         for tag_file in tag_files:
@@ -611,6 +616,7 @@ class FileStore(AbstractStore):
                 instances associated with this model version.
             run_link: Link to the run from an MLflow tracking server that generated this model.
             description: Description of the version.
+            local_model_path: Unused.
 
         Returns:
             A single object of :py:class:`mlflow.entities.model_registry.ModelVersion`
@@ -821,7 +827,7 @@ class FileStore(AbstractStore):
         self._check_root_dir()
         return list_subdirs(join(self.root_directory, FileStore.MODELS_FOLDER_NAME), full_path=True)
 
-    def _list_file_model_versions_under_path(self, path) -> List[FileModelVersion]:
+    def _list_file_model_versions_under_path(self, path) -> list[FileModelVersion]:
         model_versions = []
         model_version_dirs = list_all(
             path,
@@ -835,7 +841,7 @@ class FileStore(AbstractStore):
 
     def search_model_versions(
         self, filter_string=None, max_results=None, order_by=None, page_token=None
-    ) -> List[ModelVersion]:
+    ) -> list[ModelVersion]:
         """
         Search for model versions in backend that satisfy the filter criteria.
 
@@ -1034,4 +1040,3 @@ class FileStore(AbstractStore):
         Does not wait for the model version to become READY as a successful creation will
         immediately place the model version in a READY state.
         """
-        pass

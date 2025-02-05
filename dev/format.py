@@ -15,9 +15,7 @@ def transform(stdout: str, is_maintainer: bool) -> str:
         if m := MESSAGE_REGEX.match(line):
             path = m.group(1)
             command = (
-                "`ruff format .` or comment `@mlflow-automation autoformat`"
-                if is_maintainer
-                else "`ruff format .`"
+                "`ruff format .` or comment `/autoformat`" if is_maintainer else "`ruff format .`"
             )
             line = f"{path}: Unformatted file. Run {command} to format."
 
@@ -26,7 +24,7 @@ def transform(stdout: str, is_maintainer: bool) -> str:
 
 
 def main():
-    if "GITHUB_ACTIONS" in os.environ:
+    if "NO_FIX" in os.environ:
         with subprocess.Popen(
             [
                 *RUFF_FORMAT,

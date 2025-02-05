@@ -7,6 +7,7 @@ PyTorch (native) format
 :py:mod:`mlflow.pyfunc`
     Produced for use by generic pyfunc-based deployment tools and batch inference.
 """
+
 import atexit
 import importlib
 import logging
@@ -15,7 +16,7 @@ import posixpath
 import shutil
 import warnings
 from functools import partial
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -79,7 +80,6 @@ MAX_REQ_VERSION = Version(_ML_PACKAGE_VERSIONS["pytorch-lightning"]["autologging
 
 
 _MODEL_DATA_SUBPATH = "data"
-model_data_artifact_paths = [_MODEL_DATA_SUBPATH, _EXTRA_FILES_KEY]
 
 
 def get_default_pip_requirements():
@@ -180,9 +180,7 @@ def log_model(
 
         artifact_path: Run-relative artifact path.
         conda_env: {{ conda_env }}
-        code_paths: A list of local filesystem paths to Python file dependencies (or directories
-            containing file dependencies). These files are *prepended* to the system path when the
-            model is loaded.
+        code_paths: {{ code_paths }}
         pickle_module: The module that PyTorch should use to serialize ("pickle") the specified
             ``pytorch_model``. This is passed as the ``pickle_module`` parameter to
             ``torch.save()``.  By default, this module is also used to deserialize ("unpickle") the
@@ -223,10 +221,7 @@ def log_model(
 
         pip_requirements: {{ pip_requirements }}
         extra_pip_requirements: {{ extra_pip_requirements }}
-        metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
-
-            .. Note:: Experimental: This parameter may change or be removed in a future
-                                    release without warning.
+        metadata: {{ metadata }}
         kwargs: kwargs to pass to ``torch.save`` method.
 
     Returns:
@@ -353,9 +348,7 @@ def save_model(
         path: Local path where the model is to be saved.
         conda_env: {{ conda_env }}
         mlflow_model: :py:mod:`mlflow.models.Model` this flavor is being added to.
-        code_paths: A list of local filesystem paths to Python file dependencies (or directories
-            containing file dependencies). These files are *prepended* to the system path when the
-            model is loaded.
+        code_paths: {{ code_paths }}
         pickle_module: The module that PyTorch should use to serialize ("pickle") the specified
             ``pytorch_model``. This is passed as the ``pickle_module`` parameter to
             ``torch.save()``. By default, this module is also used to deserialize ("unpickle") the
@@ -389,10 +382,7 @@ def save_model(
             If ``None``, no extra files are added to the model.
         pip_requirements: {{ pip_requirements }}
         extra_pip_requirements: {{ extra_pip_requirements }}
-        metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
-
-            .. Note:: Experimental: This parameter may change or be removed in a future
-                                    release without warning.
+        metadata:{{ metadata }}
         kwargs: kwargs to pass to ``torch.save`` method.
 
     .. code-block:: python
@@ -451,18 +441,18 @@ def save_model(
     path = os.path.abspath(path)
     _validate_and_prepare_target_save_path(path)
 
-    if signature is None and input_example is not None:
+    if mlflow_model is None:
+        mlflow_model = Model()
+    saved_example = _save_example(mlflow_model, input_example, path)
+
+    if signature is None and saved_example is not None:
         wrapped_model = _PyTorchWrapper(pytorch_model, device="cpu")
-        signature = _infer_signature_from_input_example(input_example, wrapped_model)
+        signature = _infer_signature_from_input_example(saved_example, wrapped_model)
     elif signature is False:
         signature = None
 
-    if mlflow_model is None:
-        mlflow_model = Model()
     if signature is not None:
         mlflow_model.signature = signature
-    if input_example is not None:
-        _save_example(mlflow_model, input_example, path)
     if metadata is not None:
         mlflow_model.metadata = metadata
 
@@ -586,6 +576,7 @@ def _load_model(path, device=None, **kwargs):
     """
     Args:
         path: The path to a serialized PyTorch model.
+        device: If specified, load the model on the specified device.
         kwargs: Additional kwargs to pass to the PyTorch ``torch.load`` function.
     """
     import torch
@@ -704,7 +695,7 @@ def load_model(model_uri, dst_path=None, **kwargs):
     return _load_model(path=torch_model_artifacts_path, **kwargs)
 
 
-def _load_pyfunc(path, model_config=None):
+def _load_pyfunc(path, model_config=None, weights_only=False):  # noqa: D417
     """
     Load PyFunc implementation. Called by ``pyfunc.load_model``.
 
@@ -726,6 +717,15 @@ def _load_pyfunc(path, model_config=None):
         else:
             device = _TORCH_CPU_DEVICE_NAME
 
+    # in pytorch >= 2.6.0, the `weights_only` kwarg default has been changed from
+    # `False` to `True`. this can cause pickle deserialization errors when loading
+    # models, unless the model classes have been explicitly marked as safe using
+    # `torch.serialization.add_safe_globals()`
+    if Version(torch.__version__) >= Version("2.6.0"):
+        return _PyTorchWrapper(
+            _load_model(path, device=device, weights_only=weights_only), device=device
+        )
+
     return _PyTorchWrapper(_load_model(path, device=device), device=device)
 
 
@@ -739,14 +739,17 @@ class _PyTorchWrapper:
         self.pytorch_model = pytorch_model
         self.device = device
 
-    def predict(self, data, params: Optional[Dict[str, Any]] = None):
+    def get_raw_model(self):
+        """
+        Returns the underlying model.
+        """
+        return self.pytorch_model
+
+    def predict(self, data, params: Optional[dict[str, Any]] = None):
         """
         Args:
             data: Model input data.
             params: Additional parameters to pass to the model for inference.
-
-                .. Note:: Experimental: This parameter may change or be removed in a future
-                            release without warning.
 
         Returns:
             Model predictions.
@@ -937,9 +940,6 @@ def autolog(
     ``add_scalar`` and ``add_hparams`` methods to mlflow. In this case, there's also
     no notion of an "epoch".
 
-    .. Note:: Only pytorch-lightning modules between versions MIN_REQ_VERSION and
-        MAX_REQ_VERSION are known to be compatible with mlflow's autologging.
-
     Args:
         log_every_n_epoch: If specified, logs metrics once every `n` epochs. By default, metrics
             are logged after every epoch.
@@ -971,12 +971,12 @@ def autolog(
             pytorch-lightning >= 1.6.0.
         checkpoint_monitor: In automatic model checkpointing, the metric name to monitor if
             you set `model_checkpoint_save_best_only` to True.
-        checkpoint_save_best_only: If True, automatic model checkpointing only saves when
-            the model is considered the "best" model according to the quantity
-            monitored and previous checkpoint model is overwritten.
         checkpoint_mode: one of {"min", "max"}. In automatic model checkpointing,
             if save_best_only=True, the decision to overwrite the current save file is made based on
             either the maximization or the minimization of the monitored quantity.
+        checkpoint_save_best_only: If True, automatic model checkpointing only saves when
+            the model is considered the "best" model according to the quantity
+            monitored and previous checkpoint model is overwritten.
         checkpoint_save_weights_only: In automatic model checkpointing, if True, then
             only the model’s weights will be saved. Otherwise, the optimizer states,
             lr-scheduler states, etc are added in the checkpoint too.
@@ -1133,7 +1133,7 @@ if autolog.__doc__ is not None:
     )
 
 
-def load_checkpoint(model_class, run_id=None, epoch=None, global_step=None):
+def load_checkpoint(model_class, run_id=None, epoch=None, global_step=None, kwargs=None):
     """
     If you enable "checkpoint" in autologging, during pytorch-lightning model
     training execution, checkpointed models are logged as MLflow artifacts.
@@ -1156,6 +1156,7 @@ def load_checkpoint(model_class, run_id=None, epoch=None, global_step=None):
             "checkpoint_save_freq" to "epoch".
         global_step: The global step of the checkpoint to be loaded, if
             you set "checkpoint_save_freq" to an integer.
+        kwargs: Any extra kwargs needed to init the model.
 
     Returns:
         The instance of a pytorch-lightning model restored from the specified checkpoint.
@@ -1186,7 +1187,7 @@ def load_checkpoint(model_class, run_id=None, epoch=None, global_step=None):
         downloaded_checkpoint_filepath = download_checkpoint_artifact(
             run_id=run_id, epoch=epoch, global_step=global_step, dst_path=tmp_dir.path()
         )
-        return model_class.load_from_checkpoint(downloaded_checkpoint_filepath)
+        return model_class.load_from_checkpoint(downloaded_checkpoint_filepath, **(kwargs or {}))
 
 
 __all__ = [

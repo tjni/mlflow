@@ -8,11 +8,11 @@ from packaging.version import Version
 import mlflow.pytorch
 from mlflow.exceptions import MlflowException
 from mlflow.ml_package_versions import _ML_PACKAGE_VERSIONS
-from mlflow.pytorch import _pytorch_autolog
 from mlflow.utils.autologging_utils import (
     BatchMetricsLogger,
     ExceptionSafeAbstractClass,
     MlflowAutologgingQueueingClient,
+    disable_autologging,
     get_autologging_config,
 )
 from mlflow.utils.checkpoint_utils import MlflowModelCheckpointCallbackBase
@@ -46,7 +46,7 @@ else:
 
 def _get_optimizer_name(optimizer):
     """
-    In pytorch-lightining 1.1.0, `LightningOptimizer` was introduced:
+    In pytorch-lightning 1.1.0, `LightningOptimizer` was introduced:
     https://github.com/PyTorchLightning/pytorch-lightning/pull/4658
 
     If a user sets `enable_pl_optimizer` to True when instantiating a `Trainer` object,
@@ -66,7 +66,7 @@ def _get_optimizer_name(optimizer):
         )
 
 
-class __MLflowPLCallback(pl.Callback, metaclass=ExceptionSafeAbstractClass):
+class __MlflowPLCallback(pl.Callback, metaclass=ExceptionSafeAbstractClass):
     """
     Callback for auto-logging metrics and parameters.
     """
@@ -155,6 +155,7 @@ class __MLflowPLCallback(pl.Callback, metaclass=ExceptionSafeAbstractClass):
             Args:
                 trainer: pytorch lightning trainer instance
                 pl_module: pytorch lightning base module
+                args: additional positional arguments
             """
             # If validation loop is enabled (meaning `validation_step` is overridden),
             # log metrics in `on_validaion_epoch_end` to avoid logging the same metrics
@@ -194,6 +195,7 @@ class __MLflowPLCallback(pl.Callback, metaclass=ExceptionSafeAbstractClass):
         Args:
             trainer: pytorch lightning trainer instance
             pl_module: pytorch lightning base module
+            args: additional positional arguments
         """
         if not self.log_every_n_step:
             return
@@ -466,7 +468,7 @@ def patched_fit(original, self, *args, **kwargs):
             "outside this range."
         )
 
-    with _pytorch_autolog.disable_pytorch_autologging():
+    with disable_autologging():
         run_id = mlflow.active_run().info.run_id
         tracking_uri = mlflow.get_tracking_uri()
         client = MlflowAutologgingQueueingClient(tracking_uri)
@@ -486,9 +488,9 @@ def patched_fit(original, self, *args, **kwargs):
                 early_stop_callback = callback
                 _log_early_stop_params(early_stop_callback, client, run_id)
 
-        if not any(isinstance(callbacks, __MLflowPLCallback) for callbacks in self.callbacks):
+        if not any(isinstance(callbacks, __MlflowPLCallback) for callbacks in self.callbacks):
             self.callbacks += [
-                __MLflowPLCallback(
+                __MlflowPLCallback(
                     client, metrics_logger, run_id, log_models, log_every_n_epoch, log_every_n_step
                 )
             ]
@@ -556,8 +558,8 @@ def patched_fit(original, self, *args, **kwargs):
                 mlflow.pytorch.FLAVOR_NAME, "registered_model_name", None
             )
             mlflow.pytorch.log_model(
-                pytorch_model=self.model,
-                artifact_path="model",
+                self.model,
+                "model",
                 registered_model_name=registered_model_name,
             )
 

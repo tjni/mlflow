@@ -1,7 +1,7 @@
 import React from 'react';
 import { mockModelVersionDetailed } from '../test-utils';
 import { ModelVersionStatus, Stages } from '../constants';
-import { renderWithIntl, screen } from 'common/utils/TestUtils.react17';
+import { renderWithIntl, screen } from '@mlflow/mlflow/src/common/utils/TestUtils.react17';
 import { MemoryRouter } from '../../common/utils/RoutingUtils';
 import configureStore from 'redux-mock-store';
 import thunk from 'redux-thunk';
@@ -76,7 +76,7 @@ describe('ModelVersionTable', () => {
       modelName: modelName,
       usingNextModelsUI: true,
       modelVersions: [mockModelVersionDetailed(modelName, 1, Stages.NONE, ModelVersionStatus.READY)],
-      aliases: [{alias: 'champion', version: '1'}]
+      aliases: [{ alias: 'champion', version: '1' }],
     };
     renderWithProviders(<ModelVersionTable {...props} />);
     expect(screen.queryByRole('columnheader', { name: 'Stage' })).not.toBeInTheDocument();

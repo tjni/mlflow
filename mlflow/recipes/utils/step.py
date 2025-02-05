@@ -2,7 +2,7 @@ import logging
 import os
 import shutil
 import subprocess
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Iterable, Optional
 
 import numpy as np
 import pandas as pd
@@ -10,10 +10,11 @@ import pandas as pd
 from mlflow.exceptions import BAD_REQUEST, INVALID_PARAMETER_VALUE, MlflowException
 from mlflow.recipes.cards import pandas_renderer
 from mlflow.utils.databricks_utils import (
-    get_databricks_runtime,
+    get_databricks_runtime_version,
     is_in_databricks_runtime,
     is_running_in_ipython_environment,
 )
+from mlflow.utils.os import is_windows
 
 _logger = logging.getLogger(__name__)
 
@@ -23,7 +24,7 @@ _MAX_PROFILE_COL_SIZE = 10000  # 10k Cols
 
 
 def get_merged_eval_metrics(
-    eval_metrics: Dict[str, Dict], ordered_metric_names: Optional[List[str]] = None
+    eval_metrics: dict[str, dict], ordered_metric_names: Optional[list[str]] = None
 ):
     """
     Returns a merged Pandas DataFrame from a map of dataset to evaluation metrics.
@@ -79,8 +80,7 @@ def display_html(html_data: Optional[str] = None, html_file_path: Optional[str] 
         html_file_path = html_file_path if html_data is None else None
 
         if is_in_databricks_runtime():
-            dbr_version_image_key = get_databricks_runtime()
-            dbr_version = dbr_version_image_key.split("-")[0]
+            dbr_version = get_databricks_runtime_version()
             if int(dbr_version.split(".")[0]) < 11:
                 raise MlflowException(
                     f"Use Databricks Runtime 11 or newer with MLflow Recipes. "
@@ -127,10 +127,10 @@ def display_html(html_data: Optional[str] = None, html_file_path: Optional[str] 
 # multiprocessing and pytest don't play well together on Windows.
 # Relevant code: https://github.com/ydataai/pandas-profiling/blob/f8bad5dde27e3f87f11ac74fb8966c034bc22db8/src/pandas_profiling/model/pandas/summary_pandas.py#L76-L97
 def _get_pool_size():
-    return 1 if "PYTEST_CURRENT_TEST" in os.environ and os.name == "nt" else 0
+    return 1 if "PYTEST_CURRENT_TEST" in os.environ and is_windows() else 0
 
 
-def get_pandas_data_profiles(inputs: Iterable[Tuple[str, pd.DataFrame]]) -> str:
+def get_pandas_data_profiles(inputs: Iterable[tuple[str, pd.DataFrame]]) -> str:
     """
     Returns a data profiling string over input data frame.
 
@@ -181,7 +181,7 @@ def truncate_pandas_data_profile(title: str, data_frame) -> str:
     return (title, truncated_df)
 
 
-def validate_classification_config(
+def validate_classification_config(  # noqa: D417
     task: str, positive_class: str, input_df: pd.DataFrame, target_col: str
 ):
     """

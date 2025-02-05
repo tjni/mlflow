@@ -10,6 +10,7 @@ Python (native) `pickle <https://scikit-learn.org/stable/modules/model_persisten
     NOTE: The `mlflow.pyfunc` flavor is only added for scikit-learn models that define `predict()`,
     since `predict()` is required for pyfunc model inference.
 """
+
 import functools
 import inspect
 import logging
@@ -18,7 +19,7 @@ import pickle
 import weakref
 from collections import OrderedDict, defaultdict
 from copy import deepcopy
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import numpy as np
 import yaml
@@ -89,7 +90,6 @@ _logger = logging.getLogger(__name__)
 _SklearnTrainingSession = _get_new_training_session_class()
 
 _MODEL_DATA_SUBPATH = "model.pkl"
-model_data_artifact_paths = [_MODEL_DATA_SUBPATH]
 
 
 def _gen_estimators_to_patch():
@@ -181,9 +181,7 @@ def save_model(
         sk_model: scikit-learn model to be saved.
         path: Local path where the model is to be saved.
         conda_env: {{ conda_env }}
-        code_paths: A list of local filesystem paths to Python file dependencies (or directories
-            containing file dependencies). These files are *prepended* to the system
-            path when the model is loaded.
+        code_paths: {{ code_paths }}
         mlflow_model: :py:mod:`mlflow.models.Model` this flavor is being added to.
         serialization_format: The format in which to serialize the model. This should be one of
             the formats listed in
@@ -197,11 +195,10 @@ def save_model(
         pip_requirements: {{ pip_requirements }}
         extra_pip_requirements: {{ extra_pip_requirements }}
         pyfunc_predict_fn: The name of the prediction function to use for inference with the
-            pyfunc representation of the resulting MLflow Model; e.g. ``"predict_proba"``.
-        metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
-
-            .. Note:: Experimental: This parameter may change or be removed in a future
-                                    release without warning.
+            pyfunc representation of the resulting MLflow Model. Current supported functions
+            are: ``"predict"``, ``"predict_proba"``, ``"predict_log_proba"``,
+            ``"predict_joint_log_proba"``, and ``"score"``.
+        metadata: {{ metadata }}
 
     .. code-block:: python
         :caption: Example
@@ -248,18 +245,18 @@ def save_model(
     _validate_and_prepare_target_save_path(path)
     code_path_subdir = _validate_and_copy_code_paths(code_paths, path)
 
-    if signature is None and input_example is not None:
+    if mlflow_model is None:
+        mlflow_model = Model()
+    saved_example = _save_example(mlflow_model, input_example, path)
+
+    if signature is None and saved_example is not None:
         wrapped_model = _SklearnModelWrapper(sk_model)
-        signature = _infer_signature_from_input_example(input_example, wrapped_model)
+        signature = _infer_signature_from_input_example(saved_example, wrapped_model)
     elif signature is False:
         signature = None
 
-    if mlflow_model is None:
-        mlflow_model = Model()
     if signature is not None:
         mlflow_model.signature = signature
-    if input_example is not None:
-        _save_example(mlflow_model, input_example, path)
     if metadata is not None:
         mlflow_model.metadata = metadata
 
@@ -362,9 +359,7 @@ def log_model(
         sk_model: scikit-learn model to be saved.
         artifact_path: Run-relative artifact path.
         conda_env: {{ conda_env }}
-        code_paths: A list of local filesystem paths to Python file dependencies (or directories
-            containing file dependencies). These files are *prepended* to the system
-            path when the model is loaded.
+        code_paths: {{ code_paths }}
         serialization_format: The format in which to serialize the model. This should be one of
             the formats listed in
             ``mlflow.sklearn.SUPPORTED_SERIALIZATION_FORMATS``. The Cloudpickle
@@ -382,11 +377,10 @@ def log_model(
         pip_requirements: {{ pip_requirements }}
         extra_pip_requirements: {{ extra_pip_requirements }}
         pyfunc_predict_fn: The name of the prediction function to use for inference with the
-            pyfunc representation of the resulting MLflow Model; e.g. ``"predict_proba"``.
-        metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
-
-            .. Note:: Experimental: This parameter may change or be removed in a future
-                                    release without warning.
+            pyfunc representation of the resulting MLflow Model. Current supported functions
+            are: ``"predict"``, ``"predict_proba"``, ``"predict_log_proba"``,
+            ``"predict_joint_log_proba"``, and ``"score"``.
+        metadata: {{ metadata }}
 
     Returns:
         A :py:class:`ModelInfo <mlflow.models.model.ModelInfo>` instance that contains the
@@ -509,34 +503,42 @@ def _load_pyfunc(path):
 
 
 class _SklearnModelWrapper:
+    _SUPPORTED_CUSTOM_PREDICT_FN = [
+        "predict_proba",
+        "predict_log_proba",
+        "predict_joint_log_proba",
+        "score",
+    ]
+
     def __init__(self, sklearn_model):
         self.sklearn_model = sklearn_model
+
+        # Patch the model with custom predict functions that can be specified
+        # via `pyfunc_predict_fn` argument when saving or logging.
+        for predict_fn in self._SUPPORTED_CUSTOM_PREDICT_FN:
+            if fn := getattr(self.sklearn_model, predict_fn, None):
+                setattr(self, predict_fn, fn)
+
+    def get_raw_model(self):
+        """
+        Returns the underlying scikit-learn model.
+        """
+        return self.sklearn_model
 
     def predict(
         self,
         data,
-        params: Optional[Dict[str, Any]] = None,
+        params: Optional[dict[str, Any]] = None,
     ):
         """
         Args:
             data: Model input data.
             params: Additional parameters to pass to the model for inference.
 
-                .. Note:: Experimental: This parameter may change or be removed in a future
-                                        release without warning.
-
         Returns:
             Model predictions.
         """
         return self.sklearn_model.predict(data)
-
-    def predict_proba(self, *args, **kwargs):
-        if hasattr(self.sklearn_model, "predict_proba"):
-            return self.sklearn_model.predict_proba(*args, **kwargs)
-
-    def score(self, *args, **kwargs):
-        if hasattr(self.sklearn_model, "score"):
-            return self.sklearn_model.score(*args, **kwargs)
 
 
 class _SklearnCustomModelPicklingError(pickle.PicklingError):
@@ -671,7 +673,7 @@ class _AutologgingMetricsManager:
           then they will be assigned different name (via appending index to the
           eval_dataset_var_name) when autologging.
     (4) _metric_api_call_info, it is a double level map:
-       `_metric_api_call_info[run_id][metric_name]` wil get a list of tuples, each tuple is:
+       `_metric_api_call_info[run_id][metric_name]` will get a list of tuples, each tuple is:
          (logged_metric_key, metric_call_command_string)
         each call command string is like `metric_fn(arg1, arg2, ...)`
         This data structure is used for:
@@ -811,10 +813,11 @@ class _AutologgingMetricsManager:
 
         Args:
             self_obj: If the metric_fn is a method of an instance (e.g. `model.score`),
-            the `self_obj` represent the instance.
+                the `self_obj` represent the instance.
             metric_fn: metric function.
             call_pos_args: the positional arguments of the metric function call. If `metric_fn`
-            is instance method, then the `call_pos_args` should exclude the first `self` argument.
+                is instance method, then the `call_pos_args` should exclude the first `self`
+                argument.
             call_kwargs: the keyword arguments of the metric function call.
         """
 
@@ -1294,7 +1297,7 @@ def autolog(
     )
 
 
-def _autolog(
+def _autolog(  # noqa: D417
     flavor_name=FLAVOR_NAME,
     log_input_examples=False,
     log_model_signatures=True,
@@ -1395,7 +1398,7 @@ def _autolog(
                 model_format = get_autologging_config(flavor_name, "model_format", "xgb")
                 log_model_func(
                     self,
-                    artifact_path="model",
+                    "model",
                     signature=signature,
                     input_example=input_example,
                     registered_model_name=registered_model_name,
@@ -1404,7 +1407,7 @@ def _autolog(
             else:
                 log_model_func(
                     self,
-                    artifact_path="model",
+                    "model",
                     signature=signature,
                     input_example=input_example,
                     registered_model_name=registered_model_name,
@@ -1430,7 +1433,7 @@ def _autolog(
         params_logging_future.await_completion()
         return fit_output
 
-    def _log_pretraining_metadata(autologging_client, estimator, X, y):
+    def _log_pretraining_metadata(autologging_client, estimator, X, y):  # noqa: D417
         """
         Records metadata (e.g., params and tags) for a scikit-learn estimator prior to training.
         This is intended to be invoked within a patched scikit-learn training routine
@@ -1560,7 +1563,7 @@ def _autolog(
             )
             _log_model_with_except_handling(
                 estimator,
-                artifact_path="model",
+                "model",
                 signature=signature,
                 input_example=input_example,
                 serialization_format=serialization_format,
@@ -1571,7 +1574,7 @@ def _autolog(
             if hasattr(estimator, "best_estimator_") and log_models:
                 _log_model_with_except_handling(
                     estimator.best_estimator_,
-                    artifact_path="best_estimator",
+                    "best_estimator",
                     signature=signature,
                     input_example=input_example,
                     serialization_format=serialization_format,

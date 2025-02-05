@@ -127,6 +127,7 @@ export const parseMlModelFile = (modelName: any, version: any, mlModelFile: any,
         meta: { id, modelName, version },
       };
     } catch (error) {
+      // eslint-disable-next-line no-console -- TODO(FEINF-3587)
       console.error(error);
       return {
         type: PARSE_MLMODEL_FILE,
@@ -164,7 +165,7 @@ export const resolveFilterValue = (value: any, includeWildCard = false) => {
 };
 
 export const SEARCH_MODEL_VERSIONS = 'SEARCH_MODEL_VERSIONS';
-export const searchModelVersionsApi = (filterObj: any, id = getUUID()) => {
+export const searchModelVersionsApi = (filterObj: any, id = getUUID(), maxResults: number | undefined = undefined) => {
   const filter = Object.keys(filterObj)
     .map((key) => {
       if (Array.isArray(filterObj[key]) && filterObj[key].length > 1) {
@@ -177,9 +178,16 @@ export const searchModelVersionsApi = (filterObj: any, id = getUUID()) => {
     })
     .join('&');
 
+  const reqBody: any = {
+    filter,
+  };
+  if (maxResults) {
+    reqBody['max_results'] = maxResults;
+  }
+
   return {
     type: SEARCH_MODEL_VERSIONS,
-    payload: Services.searchModelVersions({ filter }),
+    payload: Services.searchModelVersions(reqBody),
     meta: { id },
   };
 };
