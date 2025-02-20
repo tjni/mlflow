@@ -23,7 +23,19 @@ class MockResponse:
 
     @classmethod
     def from_versions(cls, versions):
-        return cls({"releases": {v: [v + ".whl"] for v in versions}})
+        return cls(
+            {
+                "releases": {
+                    v: [
+                        {
+                            "filename": v + ".whl",
+                            "upload_time": "2023-10-04T16:38:57",
+                        }
+                    ]
+                    for v in versions
+                }
+            }
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -45,7 +57,7 @@ def run_test(src, src_expected, mock_responses):
     versions_yaml.write_text(src)
 
     with mock.patch("urllib.request.urlopen", new=patch_urlopen):
-        update_ml_package_versions.main()
+        update_ml_package_versions.update()
 
     assert versions_yaml.read_text() == src_expected
 

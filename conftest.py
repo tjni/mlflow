@@ -5,11 +5,13 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 
 import click
 import pytest
 
 from mlflow.environment_variables import _MLFLOW_TESTING, MLFLOW_TRACKING_URI
+from mlflow.utils.os import is_windows
 from mlflow.version import VERSION
 
 from tests.helper_functions import get_safe_port
@@ -161,17 +163,26 @@ def pytest_ignore_collect(collection_path, config):
         # Ignored files and directories must be included in dev/run-python-flavor-tests.sh
         model_flavors = [
             # Tests of flavor modules.
+            "tests/anthropic",
+            "tests/autogen",
             "tests/azureml",
+            "tests/bedrock",
             "tests/catboost",
+            "tests/crewai",
             "tests/diviner",
+            "tests/dspy",
             "tests/fastai",
-            "tests/gluon",
+            "tests/gemini",
+            "tests/groq",
             "tests/h2o",
             "tests/johnsnowlabs",
             "tests/keras",
             "tests/keras_core",
+            "tests/llama_index",
             "tests/langchain",
             "tests/lightgbm",
+            "tests/litellm",
+            "tests/mistral",
             "tests/mleap",
             "tests/models",
             "tests/onnx",
@@ -262,6 +273,33 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
                 )
                 break
 
+    main_thread = threading.main_thread()
+    if threads := [t for t in threading.enumerate() if t is not main_thread]:
+        terminalreporter.section("Remaining threads", yellow=True)
+        for idx, thread in enumerate(threads, start=1):
+            terminalreporter.write(f"{idx}: {thread}\n")
+
+        # Uncomment this block to print tracebacks of non-daemon threads
+        # if non_daemon_threads := [t for t in threads if not t.daemon]:
+        #     frames = sys._current_frames()
+        #     terminalreporter.section("Tracebacks of non-daemon threads", yellow=True)
+        #     for thread in non_daemon_threads:
+        #         thread.join(timeout=1)
+        #         if thread.is_alive() and (frame := frames.get(thread.ident)):
+        #             terminalreporter.section(repr(thread), sep="~")
+        #             terminalreporter.write("".join(traceback.format_stack(frame)))
+
+    try:
+        import psutil
+    except ImportError:
+        pass
+    else:
+        current_process = psutil.Process()
+        if children := current_process.children(recursive=True):
+            terminalreporter.section("Remaining child processes", yellow=True)
+            for idx, child in enumerate(children, start=1):
+                terminalreporter.write(f"{idx}: {child}\n")
+
 
 @pytest.fixture(scope="module", autouse=True)
 def clean_up_envs():
@@ -274,7 +312,7 @@ def clean_up_envs():
         from mlflow.utils.virtualenv import _get_mlflow_virtualenv_root
 
         shutil.rmtree(_get_mlflow_virtualenv_root(), ignore_errors=True)
-        if os.name != "nt":
+        if not is_windows():
             conda_info = json.loads(subprocess.check_output(["conda", "info", "--json"], text=True))
             root_prefix = conda_info["root_prefix"]
             regex = re.compile(r"mlflow-\w{32,}")
@@ -345,10 +383,14 @@ def serve_wheel(request, tmp_path_factory):
         ],
         cwd=root,
     ) as prc:
-        url = f"http://localhost:{port}"
-        if existing_url := os.environ.get("PIP_EXTRA_INDEX_URL"):
-            url = f"{existing_url} {url}"
-        os.environ["PIP_EXTRA_INDEX_URL"] = url
-
-        yield
-        prc.terminate()
+        try:
+            url = f"http://localhost:{port}"
+            if existing_url := os.environ.get("PIP_EXTRA_INDEX_URL"):
+                url = f"{existing_url} {url}"
+            os.environ["PIP_EXTRA_INDEX_URL"] = url
+            # Set the `UV_INDEX` environment variable to allow fetching the wheel from the
+            # url when using `uv` as environment manager
+            os.environ["UV_INDEX"] = f"mlflow={url}"
+            yield
+        finally:
+            prc.terminate()

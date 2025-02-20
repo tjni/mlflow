@@ -9,22 +9,18 @@ from packaging.version import Version
 
 import mlflow
 from mlflow.entities import RunTag
+from mlflow.entities.run_status import RunStatus
 from mlflow.exceptions import MlflowException
-from mlflow.ml_package_versions import _ML_PACKAGE_VERSIONS
+from mlflow.langchain.runnables import get_runnable_steps
 from mlflow.tracking.context import registry as context_registry
-from mlflow.utils.autologging_utils import (
-    ExceptionSafeAbstractClass,
-    disable_autologging,
-    get_autologging_config,
-)
+from mlflow.utils import name_utils
+from mlflow.utils.autologging_utils import get_autologging_config
+from mlflow.utils.autologging_utils.config import AutoLoggingConfig
 from mlflow.utils.autologging_utils.safety import _resolve_extra_tags
-
-MIN_REQ_VERSION = Version(_ML_PACKAGE_VERSIONS["langchain"]["autologging"]["minimum"])
-MAX_REQ_VERSION = Version(_ML_PACKAGE_VERSIONS["langchain"]["autologging"]["maximum"])
 
 _logger = logging.getLogger(__name__)
 
-UNSUPPORT_LOG_MODEL_MESSAGE = (
+UNSUPPORTED_LOG_MODEL_MESSAGE = (
     "MLflow autologging does not support logging models containing BaseRetriever because "
     "logging the model requires `loader_fn` and `persist_dir`. Please log the model manually "
     "using `mlflow.langchain.log_model(model, artifact_path, loader_fn=..., persist_dir=...)`"
@@ -32,11 +28,117 @@ UNSUPPORT_LOG_MODEL_MESSAGE = (
 INFERENCE_FILE_NAME = "inference_inputs_outputs.json"
 
 
+# A *global* state that indicates whether MLflow should patch the inference method
+# for artifact auto-logging (model, signature input example). This disablement
+# is global across threads, as single model inference can trigger multiple threads,
+# for example, LangChain's batch()/abatch() API processes each request in a child thread.
+IS_PATCHING_DISABLED_FOR_ARTIFACTS = False
+
+
+@contextlib.contextmanager
+def disable_patching():
+    """
+    Temporarily disable auto-logging for optional artifacts (model, signature, input
+    examples) to avoid "double-logging" when invoking the patched chain. Without this
+    disablement applied, the patched inference method calls child components that may
+    also be patched, leading to redundant logging.
+    """
+    global IS_PATCHING_DISABLED_FOR_ARTIFACTS
+    original_artifact_flag = IS_PATCHING_DISABLED_FOR_ARTIFACTS
+    IS_PATCHING_DISABLED_FOR_ARTIFACTS = True
+
+    try:
+        yield
+    finally:
+        IS_PATCHING_DISABLED_FOR_ARTIFACTS = original_artifact_flag
+
+
+def patched_inference(func_name, original, self, *args, **kwargs):
+    """
+    A patched implementation of langchain models inference process which enables
+    logging the traces, and other optional artifacts like model, input examples, etc.
+
+    We patch inference functions for different models based on their usage.
+    """
+
+    def _invoke(self, *args, **kwargs):
+        with disable_patching():
+            return original(self, *args, **kwargs)
+
+    config = AutoLoggingConfig.init(mlflow.langchain.FLAVOR_NAME)
+    if not IS_PATCHING_DISABLED_FOR_ARTIFACTS and config.should_log_optional_artifacts():
+        with _setup_autolog_run(config, self) as run_id:
+            result = _invoke(self, *args, **kwargs)
+            _log_optional_artifacts(config, run_id, result, self, func_name, *args, **kwargs)
+    else:
+        result = _invoke(self, *args, **kwargs)
+    return result
+
+
+@contextlib.contextmanager
+def _setup_autolog_run(config, model):
+    """Set up autologging run and return the run ID.
+
+    This function only creates a run when there is no active run and the model does not have
+    a run ID attribute propagated from the previous call. Iff it creates a new run, MLflow should
+    terminate the run at the end of the inference.
+
+    Args:
+        config: AutoLoggingConfig: The autologging configuration.
+        model: Any: The LangChain model instance that runs the inference.
+
+    Returns: yields the run IDs
+    """
+    if propagated_run_id := getattr(model, "run_id", None):
+        # When model has "run_id" attribute, it means the model is already invoked once with autolog
+        # enabled and the run_id is propagated from the previous call, so we don't create a new run.
+        run_id = propagated_run_id
+        # The run should be already terminated at the end of the previous call.
+        should_terminate_run = False
+
+    elif active_run := mlflow.active_run():
+        run_id = active_run.info.run_id
+        tags = _resolve_tags(config.extra_tags, active_run)
+        mlflow.MlflowClient().log_batch(run_id, tags=[RunTag(k, str(v)) for k, v in tags.items()])
+        should_terminate_run = False
+    else:
+        from mlflow.tracking.fluent import _get_experiment_id
+
+        run = mlflow.MlflowClient().create_run(
+            experiment_id=_get_experiment_id(),
+            run_name="langchain-" + name_utils._generate_random_name(),
+            tags=_resolve_tags(config.extra_tags),
+        )
+        run_id = run.info.run_id
+        should_terminate_run = True
+
+    run_status = None
+    try:
+        yield run_id
+    except Exception:
+        run_status = RunStatus.to_string(RunStatus.FAILED)
+        raise
+    finally:
+        if should_terminate_run:
+            mlflow.MlflowClient().set_terminated(run_id, status=run_status)
+
+
+def _resolve_tags(extra_tags, active_run=None):
+    resolved_tags = context_registry.resolve_tags(extra_tags)
+    tags = _resolve_extra_tags(mlflow.langchain.FLAVOR_NAME, resolved_tags)
+    if active_run:
+        # Some context tags like mlflow.runName are immutable once logged, but they might be already
+        # set when the run is created, then we should avoid updating them.
+        excluded_tags = {tag for tag in active_run.data.tags.keys() if tag.startswith("mlflow.")}
+        tags = {k: v for k, v in tags.items() if k not in excluded_tags}
+    return tags
+
+
 def _get_input_data_from_function(func_name, model, args, kwargs):
     func_param_name_mapping = {
-        "__call__": "inputs",
         "invoke": "input",
-        "get_relevant_documents": "query",
+        "batch": "inputs",
+        "stream": "input",
     }
     input_example_exc = None
     if param_name := func_param_name_mapping.get(func_name):
@@ -69,85 +171,31 @@ def _convert_data_to_dict(data, key):
     raise MlflowException("Unsupported data type.")
 
 
-def _combine_input_and_output(input, output, session_id, func_name):
-    """
-    Combine input and output into a single dictionary
-    """
-    if func_name == "get_relevant_documents" and output is not None:
-        output = [{"page_content": doc.page_content, "metadata": doc.metadata} for doc in output]
-        # to make sure output is inside a single row when converted into pandas DataFrame
-        output = [output]
-    result = {"session_id": [session_id]}
-    if input:
-        result.update(_convert_data_to_dict(input, "input"))
-    if output:
-        result.update(_convert_data_to_dict(output, "output"))
-    return result
-
-
 def _update_langchain_model_config(model):
+    # Langchain models are Pydantic models, and the value for extra is
+    # ignored, we need to set it to allow so as to set attributes on
+    # the model to keep track of logging status
+    import langchain
+
     try:
-        from langchain_core.pydantic_v1 import Extra
-    except ImportError as e:
+        # LangChain 0.3.0 and above is fully migrated to Pydantic v2
+        if Version(langchain.__version__) >= Version("0.3.0"):
+            if hasattr(model, "model_config") and model.model_config is not None:
+                model.model_config["extra"] = "allow"
+                model.__pydantic_extra__ = {}
+                return True
+        else:
+            from langchain_core.pydantic_v1 import Extra
+
+            if hasattr(model, "__config__"):
+                model.__config__.extra = Extra.allow
+            return True
+    except Exception as e:
         warnings.warn(
-            "MLflow langchain autologging might log model several "
-            "times due to the pydantic.config.Extra import error. "
-            f"Error: {e}"
+            "Failed to set extra attribute on the model for keeping track of logging status. "
+            f"MLflow langchain autologging might log model several times. Error: {e}"
         )
         return False
-    else:
-        # Langchain models are Pydantic models, and the value for extra is
-        # ignored, we need to set it to allow so as to set attributes on
-        # the model to keep track of logging status
-        if hasattr(model, "__config__"):
-            model.__config__.extra = Extra.allow
-        return True
-
-
-def _inject_mlflow_callback(func_name, mlflow_callback, args, kwargs):
-    if func_name == "invoke":
-        from langchain.schema.runnable.config import RunnableConfig
-
-        in_args = False
-        # `config` is the second positional argument of runnable.invoke function
-        # https://github.com/langchain-ai/langchain/blob/7d444724d7582386de347fb928619c2243bd0e55/libs/core/langchain_core/runnables/base.py#L468
-        if len(args) >= 2:
-            config = args[1]
-            in_args = True
-        else:
-            config = kwargs.get("config", None)
-        if config is None:
-            callbacks = [mlflow_callback]
-            config = RunnableConfig(callbacks=callbacks)
-        else:
-            callbacks = config.get("callbacks") or []
-            callbacks.append(mlflow_callback)
-            config["callbacks"] = callbacks
-        if in_args:
-            args = (args[0], config) + args[2:]
-        else:
-            kwargs["config"] = config
-        return args, kwargs
-
-    if func_name == "__call__":
-        # `callbacks` is the third positional argument of chain.__call__ function
-        # https://github.com/langchain-ai/langchain/blob/7d444724d7582386de347fb928619c2243bd0e55/libs/langchain/langchain/chains/base.py#L320
-        if len(args) >= 3:
-            callbacks = args[2] or []
-            callbacks.append(mlflow_callback)
-            args = args[:2] + (callbacks,) + args[3:]
-        else:
-            callbacks = kwargs.get("callbacks") or []
-            callbacks.append(mlflow_callback)
-            kwargs["callbacks"] = callbacks
-        return args, kwargs
-
-    # https://github.com/langchain-ai/langchain/blob/7d444724d7582386de347fb928619c2243bd0e55/libs/core/langchain_core/retrievers.py#L173
-    if func_name == "get_relevant_documents":
-        callbacks = kwargs.get("callbacks") or []
-        callbacks.append(mlflow_callback)
-        kwargs["callbacks"] = callbacks
-        return args, kwargs
 
 
 def _runnable_with_retriever(model):
@@ -161,10 +209,13 @@ def _runnable_with_retriever(model):
             return any(_runnable_with_retriever(runnable) for _, runnable in model.branches)
 
         if isinstance(model, RunnableParallel):
-            return any(_runnable_with_retriever(runnable) for runnable in model.steps.values())
+            return any(
+                _runnable_with_retriever(runnable)
+                for runnable in get_runnable_steps(model).values()
+            )
 
         if isinstance(model, RunnableSequence):
-            return any(_runnable_with_retriever(runnable) for runnable in model.steps)
+            return any(_runnable_with_retriever(runnable) for runnable in get_runnable_steps(model))
 
         if isinstance(model, RunnableAssign):
             return _runnable_with_retriever(model.mapper)
@@ -180,96 +231,19 @@ def _chain_with_retriever(model):
     return False
 
 
-def patched_inference(func_name, original, self, *args, **kwargs):
-    """
-    A patched implementation of langchain models inference process which enables logging the
-    following parameters, metrics and artifacts:
-
-    - model
-    - metrics
-    - data
-
-    We patch either `invoke` or `__call__` function for different models
-    based on their usage.
-    """
-
-    import langchain
-    from langchain_community.callbacks import MlflowCallbackHandler
-
-    class _MLflowLangchainCallback(MlflowCallbackHandler, metaclass=ExceptionSafeAbstractClass):
-        """
-        Callback for auto-logging metrics and parameters.
-        We need to inherit ExceptionSafeAbstractClass to avoid invalid new
-        input arguments added to original function call.
-        """
-
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-
-    _lc_version = Version(langchain.__version__)
-    if not MIN_REQ_VERSION <= _lc_version <= MAX_REQ_VERSION:
-        warnings.warn(
-            "Autologging is known to be compatible with langchain versions between "
-            f"{MIN_REQ_VERSION} and {MAX_REQ_VERSION} and may not succeed with packages "
-            "outside this range."
-        )
-
-    run_id = getattr(self, "run_id", None)
-    active_run = mlflow.active_run()
-    if run_id is None:
-        # only log the tags once
-        extra_tags = get_autologging_config(mlflow.langchain.FLAVOR_NAME, "extra_tags", None)
-        # include run context tags
-        resolved_tags = context_registry.resolve_tags(extra_tags)
-        tags = _resolve_extra_tags(mlflow.langchain.FLAVOR_NAME, resolved_tags)
-        if active_run:
-            run_id = active_run.info.run_id
-            mlflow.MlflowClient().log_batch(
-                run_id=run_id,
-                tags=[RunTag(key, str(value)) for key, value in tags.items()],
-            )
-    else:
-        tags = None
-    # TODO: test adding callbacks works
-    # Use session_id-inference_id as artifact directory where mlflow
-    # callback logs artifacts into, to avoid overriding artifacts
-    session_id = getattr(self, "session_id", uuid.uuid4().hex)
-    inference_id = getattr(self, "inference_id", 0)
-    mlflow_callback = _MLflowLangchainCallback(
-        tracking_uri=mlflow.get_tracking_uri(),
-        run_id=run_id,
-        artifacts_dir=f"artifacts-{session_id}-{inference_id}",
-        tags=tags,
-    )
-    args, kwargs = _inject_mlflow_callback(func_name, mlflow_callback, args, kwargs)
-    with disable_autologging():
-        result = original(self, *args, **kwargs)
-
-    mlflow_callback.flush_tracker()
-
-    log_models = get_autologging_config(mlflow.langchain.FLAVOR_NAME, "log_models", False)
-    log_input_examples = get_autologging_config(
-        mlflow.langchain.FLAVOR_NAME, "log_input_examples", False
-    )
-    log_model_signatures = get_autologging_config(
-        mlflow.langchain.FLAVOR_NAME, "log_model_signatures", False
-    )
+def _log_optional_artifacts(autolog_config, run_id, result, self, func_name, *args, **kwargs):
     input_example = None
-    if log_models and not hasattr(self, "model_logged"):
-        if (
-            (func_name == "get_relevant_documents")
-            or _runnable_with_retriever(self)
-            or _chain_with_retriever(self)
-        ):
-            _logger.info(UNSUPPORT_LOG_MODEL_MESSAGE)
+    if autolog_config.log_models and not hasattr(self, "_mlflow_model_logged"):
+        if _runnable_with_retriever(self) or _chain_with_retriever(self):
+            _logger.info(UNSUPPORTED_LOG_MODEL_MESSAGE)
         else:
             # warn user in case we did't capture some cases where retriever is used
-            warnings.warn(UNSUPPORT_LOG_MODEL_MESSAGE)
-            if log_input_examples:
+            warnings.warn(UNSUPPORTED_LOG_MODEL_MESSAGE)
+            if autolog_config.log_input_examples:
                 input_example = deepcopy(
                     _get_input_data_from_function(func_name, self, args, kwargs)
                 )
-                if not log_model_signatures:
+                if not autolog_config.log_model_signatures:
                     _logger.info(
                         "Signature is automatically generated for logged model if "
                         "input_example is provided. To disable log_model_signatures, "
@@ -280,48 +254,29 @@ def patched_inference(func_name, original, self, *args, **kwargs):
                 mlflow.langchain.FLAVOR_NAME, "registered_model_name", None
             )
             try:
-                with disable_autologging():
+                with disable_patching():
                     mlflow.langchain.log_model(
                         self,
                         "model",
                         input_example=input_example,
                         registered_model_name=registered_model_name,
-                        run_id=mlflow_callback.mlflg.run_id,
+                        run_id=run_id,
                     )
             except Exception as e:
                 _logger.warning(f"Failed to log model due to error {e}.")
-            if _update_langchain_model_config(self):
-                self.model_logged = True
+        # only try logging model once, even if it can't be logged
+        # we don't want to spam the user with warnings/infos
+        if _update_langchain_model_config(self):
+            self._mlflow_model_logged = True
 
     # Even if the model is not logged, we keep a single run per model
     if _update_langchain_model_config(self):
+        # NB: We have to set these attributes AFTER the model is logged, otherwise those extra
+        # attributes will be logged as a part of the pickled model and pollute the loaded model.
         if not hasattr(self, "run_id"):
-            self.run_id = mlflow_callback.mlflg.run_id
+            self.run_id = run_id
         if not hasattr(self, "session_id"):
-            self.session_id = session_id
-        self.inference_id = inference_id + 1
-
-    log_inputs_outputs = get_autologging_config(
-        mlflow.langchain.FLAVOR_NAME, "log_inputs_outputs", False
-    )
-    if log_inputs_outputs:
-        if input_example is None:
-            input_data = deepcopy(_get_input_data_from_function(func_name, self, args, kwargs))
-            if input_data is None:
-                _logger.info("Input data gathering failed, only log inference results.")
-        else:
-            input_data = input_example
-        try:
-            data_dict = _combine_input_and_output(input_data, result, self.session_id, func_name)
-        except Exception as e:
-            _logger.warning(
-                f"Failed to log inputs and outputs into `{INFERENCE_FILE_NAME}` "
-                f"file due to error {e}."
-            )
-        mlflow.log_table(data_dict, INFERENCE_FILE_NAME, run_id=mlflow_callback.mlflg.run_id)
-
-    # Terminate the run if it is not managed by the user
-    if active_run is None or active_run.info.run_id != mlflow_callback.mlflg.run_id:
-        mlflow.MlflowClient().set_terminated(mlflow_callback.mlflg.run_id)
+            self.session_id = uuid.uuid4().hex
+        self.inference_id = getattr(self, "inference_id", 0) + 1
 
     return result

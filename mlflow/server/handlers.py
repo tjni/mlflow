@@ -1,4 +1,6 @@
 # Define all the service endpoint handlers here.
+import bisect
+import io
 import json
 import logging
 import os
@@ -15,14 +17,25 @@ from flask import Response, current_app, jsonify, request, send_file
 from google.protobuf import descriptor
 from google.protobuf.json_format import ParseError
 
-from mlflow.entities import DatasetInput, ExperimentTag, FileInfo, Metric, Param, RunTag, ViewType
+from mlflow.entities import (
+    DatasetInput,
+    ExperimentTag,
+    FileInfo,
+    Metric,
+    Param,
+    RunTag,
+    ViewType,
+)
 from mlflow.entities.model_registry import ModelVersionTag, RegisteredModelTag
 from mlflow.entities.multipart_upload import MultipartUploadPart
+from mlflow.entities.trace_info import TraceInfo
+from mlflow.entities.trace_status import TraceStatus
 from mlflow.environment_variables import MLFLOW_DEPLOYMENTS_TARGET
 from mlflow.exceptions import MlflowException, _UnsupportedMultipartUploadException
 from mlflow.models import Model
 from mlflow.protos import databricks_pb2
 from mlflow.protos.databricks_pb2 import (
+    BAD_REQUEST,
     INVALID_PARAMETER_VALUE,
     RESOURCE_DOES_NOT_EXIST,
 )
@@ -68,11 +81,15 @@ from mlflow.protos.service_pb2 import (
     DeleteExperiment,
     DeleteRun,
     DeleteTag,
+    DeleteTraces,
+    DeleteTraceTag,
+    EndTrace,
     GetExperiment,
     GetExperimentByName,
     GetMetricHistory,
     GetMetricHistoryBulkInterval,
     GetRun,
+    GetTraceInfo,
     ListArtifacts,
     LogBatch,
     LogInputs,
@@ -82,10 +99,14 @@ from mlflow.protos.service_pb2 import (
     MlflowService,
     RestoreExperiment,
     RestoreRun,
+    SearchDatasets,
     SearchExperiments,
     SearchRuns,
+    SearchTraces,
     SetExperimentTag,
     SetTag,
+    SetTraceTag,
+    StartTrace,
     UpdateExperiment,
     UpdateRun,
 )
@@ -93,6 +114,10 @@ from mlflow.server.validation import _validate_content_type
 from mlflow.store.artifact.artifact_repo import MultipartUploadMixin
 from mlflow.store.artifact.artifact_repository_registry import get_artifact_repository
 from mlflow.store.db.db_types import DATABASE_ENGINES
+from mlflow.tracing.artifact_utils import (
+    TRACE_DATA_FILE_NAME,
+    get_artifact_uri_for_trace,
+)
 from mlflow.tracking._model_registry import utils as registry_utils
 from mlflow.tracking._model_registry.registry import ModelRegistryStoreRegistry
 from mlflow.tracking._tracking_service import utils
@@ -104,13 +129,20 @@ from mlflow.utils.promptlab_utils import _create_promptlab_run_impl
 from mlflow.utils.proto_json_utils import message_to_json, parse_dict
 from mlflow.utils.string_utils import is_string_type
 from mlflow.utils.uri import is_local_uri, validate_path_is_safe, validate_query_string
-from mlflow.utils.validation import _validate_batch_log_api_req
+from mlflow.utils.validation import (
+    _validate_batch_log_api_req,
+    invalid_value,
+    missing_value,
+)
 
 _logger = logging.getLogger(__name__)
 _tracking_store = None
 _model_registry_store = None
 _artifact_repo = None
 STATIC_PREFIX_ENV_VAR = "_MLFLOW_STATIC_PREFIX"
+MAX_RUNS_GET_METRIC_HISTORY_BULK = 100
+MAX_RESULTS_PER_RUN = 2500
+MAX_RESULTS_GET_METRIC_HISTORY = 25000
 
 
 class TrackingStoreRegistryWrapper(TrackingStoreRegistry):
@@ -172,6 +204,39 @@ def _get_artifact_repo_mlflow_artifacts():
     if _artifact_repo is None:
         _artifact_repo = get_artifact_repository(os.environ[ARTIFACTS_DESTINATION_ENV_VAR])
     return _artifact_repo
+
+
+def _get_trace_artifact_repo(trace_info: TraceInfo):
+    """
+    Resolve the artifact repository for fetching data for the given trace.
+
+    Args:
+        trace_info: The trace info object containing metadata about the trace.
+    """
+    artifact_uri = get_artifact_uri_for_trace(trace_info)
+
+    if _is_servable_proxied_run_artifact_root(artifact_uri):
+        # If the artifact location is a proxied run artifact root (e.g. mlflow-artifacts://...),
+        # we need to resolve it to the actual artifact location.
+        from mlflow.server import ARTIFACTS_DESTINATION_ENV_VAR
+
+        path = _get_proxied_run_artifact_destination_path(artifact_uri)
+        if not path:
+            raise MlflowException(
+                f"Failed to resolve the proxied run artifact URI: {artifact_uri}. ",
+                "Trace artifact URI must contain subpath to the trace data directory.",
+                error_code=BAD_REQUEST,
+            )
+        root = os.environ[ARTIFACTS_DESTINATION_ENV_VAR]
+        artifact_uri = posixpath.join(root, path)
+
+        # We don't set it to global var unlike run artifact, because the artifact repo has
+        # to be created with full trace artifact URI including request_id.
+        # e.g. s3://<experiment_id>/traces/<request_id>
+        artifact_repo = get_artifact_repository(artifact_uri)
+    else:
+        artifact_repo = get_artifact_repository(artifact_uri)
+    return artifact_repo
 
 
 def _is_serving_proxied_artifacts():
@@ -338,11 +403,21 @@ def _assert_array(x):
     assert isinstance(x, list)
 
 
-def _assert_required(x):
-    assert x is not None
-    # When parsing JSON payloads via proto, absent string fields
-    # are expressed as empty strings
-    assert x != ""
+def _assert_map_key_present(x):
+    _assert_array(x)
+    for entry in x:
+        _assert_required(entry.get("key"))
+
+
+def _assert_required(x, path=None):
+    if path is None:
+        assert x is not None
+        # When parsing JSON payloads via proto, absent string fields
+        # are expressed as empty strings
+        assert x != ""
+    else:
+        assert x is not None, missing_value(path)
+        assert x != "", missing_value(path)
 
 
 def _assert_less_than_or_equal(x, max_value, message=None):
@@ -399,9 +474,8 @@ def _validate_param_against_schema(schema, param, value, proto_parsing_succeeded
             elif f == _assert_required:
                 message = f"Missing value for required parameter '{param}'."
             else:
-                message = (
-                    f"Invalid value {value} for parameter '{param}' supplied."
-                    f" Hint: Value was of type '{type(value).__name__}'."
+                message = invalid_value(
+                    param, value, f" Hint: Value was of type '{type(value).__name__}'."
                 )
             raise MlflowException(
                 message=(
@@ -419,31 +493,22 @@ def _get_request_json(flask_request=request):
 
 
 def _get_request_message(request_message, flask_request=request, schema=None):
-    from querystring_parser import parser
-
-    if flask_request.method == "GET" and len(flask_request.query_string) > 0:
-        # This is a hack to make arrays of length 1 work with the parser.
-        # for example experiment_ids%5B%5D=0 should be parsed to {experiment_ids: [0]}
-        # but it gets parsed to {experiment_ids: 0}
-        # but it doesn't. However, experiment_ids%5B0%5D=0 will get parsed to the right
-        # result.
-        query_string = re.sub("%5B%5D", "%5B0%5D", flask_request.query_string.decode("utf-8"))
-        request_dict = parser.parse(query_string, normalized=True)
+    if flask_request.method == "GET" and flask_request.args:
         # Convert atomic values of repeated fields to lists before calling protobuf deserialization.
         # Context: We parse the parameter string into a dictionary outside of protobuf since
         # protobuf does not know how to read the query parameters directly. The query parser above
         # has no type information and hence any parameter that occurs exactly once is parsed as an
         # atomic value. Since protobuf requires that the values of repeated fields are lists,
         # deserialization will fail unless we do the fix below.
+        request_json = {}
         for field in request_message.DESCRIPTOR.fields:
-            if (
-                field.label == descriptor.FieldDescriptor.LABEL_REPEATED
-                and field.name in request_dict
-            ):
-                if not isinstance(request_dict[field.name], list):
-                    request_dict[field.name] = [request_dict[field.name]]
-        request_json = request_dict
+            if field.name not in flask_request.args:
+                continue
 
+            if field.label == descriptor.FieldDescriptor.LABEL_REPEATED:
+                request_json[field.name] = flask_request.args.getlist(field.name)
+            else:
+                request_json[field.name] = flask_request.args.get(field.name)
     else:
         request_json = _get_request_json(flask_request)
 
@@ -553,12 +618,8 @@ def _disable_if_artifacts_only(func):
 
 @catch_mlflow_exception
 def get_artifact_handler():
-    from querystring_parser import parser
-
-    query_string = request.query_string.decode("utf-8")
-    request_dict = parser.parse(query_string, normalized=True)
-    run_id = request_dict.get("run_id") or request_dict.get("run_uuid")
-    path = request_dict["path"]
+    run_id = request.args.get("run_id") or request.args.get("run_uuid")
+    path = request.args["path"]
     path = validate_path_is_safe(path)
     run = _get_tracking_store().get_run(run_id)
 
@@ -599,13 +660,13 @@ def _create_experiment():
     tags = [ExperimentTag(tag.key, tag.value) for tag in request_message.tags]
 
     # Validate query string in artifact location to prevent attacks
-    parsed_artifact_locaion = urllib.parse.urlparse(request_message.artifact_location)
-    if parsed_artifact_locaion.fragment:
+    parsed_artifact_location = urllib.parse.urlparse(request_message.artifact_location)
+    if parsed_artifact_location.fragment or parsed_artifact_location.params:
         raise MlflowException(
-            "'artifact_location' URL can't include fragment part.",
+            "'artifact_location' URL can't include fragments or params.",
             error_code=INVALID_PARAMETER_VALUE,
         )
-    validate_query_string(parsed_artifact_locaion.query)
+    validate_query_string(parsed_artifact_location.query)
     experiment_id = _get_tracking_store().create_experiment(
         request_message.name, request_message.artifact_location, tags
     )
@@ -639,7 +700,8 @@ def get_experiment_impl(request_message):
 @_disable_if_artifacts_only
 def _get_experiment_by_name():
     request_message = _get_request_message(
-        GetExperimentByName(), schema={"experiment_name": [_assert_required, _assert_string]}
+        GetExperimentByName(),
+        schema={"experiment_name": [_assert_required, _assert_string]},
     )
     response_message = GetExperimentByName.Response()
     store_exp = _get_tracking_store().get_experiment_by_name(request_message.experiment_name)
@@ -672,7 +734,8 @@ def _delete_experiment():
 @_disable_if_artifacts_only
 def _restore_experiment():
     request_message = _get_request_message(
-        RestoreExperiment(), schema={"experiment_id": [_assert_required, _assert_string]}
+        RestoreExperiment(),
+        schema={"experiment_id": [_assert_required, _assert_string]},
     )
     _get_tracking_store().restore_experiment(request_message.experiment_id)
     response_message = RestoreExperiment.Response()
@@ -792,7 +855,10 @@ def _log_metric():
         },
     )
     metric = Metric(
-        request_message.key, request_message.value, request_message.timestamp, request_message.step
+        request_message.key,
+        request_message.value,
+        request_message.timestamp,
+        request_message.step,
     )
     run_id = request_message.run_id or request_message.run_uuid
     _get_tracking_store().log_metric(run_id, metric)
@@ -928,10 +994,20 @@ def _search_runs():
         schema={
             "experiment_ids": [_assert_array],
             "filter": [_assert_string],
-            "max_results": [_assert_intlike, lambda x: _assert_less_than_or_equal(int(x), 50000)],
+            "max_results": [
+                _assert_intlike,
+                lambda x: _assert_less_than_or_equal(int(x), 50000),
+            ],
             "order_by": [_assert_array, _assert_item_type_string],
         },
     )
+    response_message = search_runs_impl(request_message)
+    response = Response(mimetype="application/json")
+    response.set_data(message_to_json(response_message))
+    return response
+
+
+def search_runs_impl(request_message):
     response_message = SearchRuns.Response()
     run_view_type = ViewType.ACTIVE_ONLY
     if request_message.HasField("run_view_type"):
@@ -947,9 +1023,7 @@ def _search_runs():
     response_message.runs.extend([r.to_proto() for r in run_entities])
     if run_entities.token:
         response_message.next_page_token = run_entities.token
-    response = Response(mimetype="application/json")
-    response.set_data(message_to_json(response_message))
-    return response
+    return response_message
 
 
 @catch_mlflow_exception
@@ -963,6 +1037,13 @@ def _list_artifacts():
             "page_token": [_assert_string],
         },
     )
+    response_message = list_artifacts_impl(request_message)
+    response = Response(mimetype="application/json")
+    response.set_data(message_to_json(response_message))
+    return response
+
+
+def list_artifacts_impl(request_message):
     response_message = ListArtifacts.Response()
     if request_message.HasField("path"):
         path = request_message.path
@@ -982,9 +1063,7 @@ def _list_artifacts():
 
     response_message.files.extend([a.to_proto() for a in artifact_entities])
     response_message.root_uri = run.info.artifact_uri
-    response = Response(mimetype="application/json")
-    response.set_data(message_to_json(response_message))
-    return response
+    return response_message
 
 
 @catch_mlflow_exception
@@ -1116,27 +1195,32 @@ def get_metric_history_bulk_handler():
     }
 
 
-def _get_sampled_steps_from_steps(start_step, end_step, max_results):
-    num_steps = end_step - start_step + 1
+def _get_sampled_steps_from_steps(
+    start_step: int, end_step: int, max_results: int, all_steps: list[int]
+) -> set[int]:
+    # NOTE: all_steps should be sorted before
+    # being passed to this function
+    start_idx = bisect.bisect_left(all_steps, start_step)
+    end_idx = bisect.bisect_right(all_steps, end_step)
+    if end_idx - start_idx <= max_results:
+        return set(all_steps[start_idx:end_idx])
+
+    num_steps = end_idx - start_idx
     interval = num_steps / max_results
-    grouped_steps = {}
-    # include both start_step & end_step
-    for i in range(start_step, end_step + 1):
-        idx = (i - start_step) // interval
-        if idx not in grouped_steps:
-            grouped_steps[idx] = i
-        else:
-            grouped_steps[idx] = min(grouped_steps[idx], i)
-    return list(grouped_steps.values())
+    sampled_steps = []
+
+    for i in range(0, max_results):
+        idx = start_idx + int(i * interval)
+        if idx < num_steps:
+            sampled_steps.append(all_steps[idx])
+
+    sampled_steps.append(all_steps[end_idx - 1])
+    return set(sampled_steps)
 
 
 @catch_mlflow_exception
 @_disable_if_artifacts_only
 def get_metric_history_bulk_interval_handler():
-    MAX_RUNS_GET_METRIC_HISTORY_BULK = 100
-    MAX_RESULTS_PER_RUN = 2500
-    MAX_RESULTS_GET_METRIC_HISTORY = 25000
-
     request_message = _get_request_message(
         GetMetricHistoryBulkInterval(),
         schema={
@@ -1165,7 +1249,13 @@ def get_metric_history_bulk_interval_handler():
             ],
         },
     )
+    response_message = get_metric_history_bulk_interval_impl(request_message)
+    response = Response(mimetype="application/json")
+    response.set_data(message_to_json(response_message))
+    return response
 
+
+def get_metric_history_bulk_interval_impl(request_message):
     args = request.args
     run_ids = request_message.run_ids
     metric_key = request_message.metric_key
@@ -1173,23 +1263,13 @@ def get_metric_history_bulk_interval_handler():
 
     store = _get_tracking_store()
 
-    def _get_max_step_for_metric(run_id, metric_key):
-        if hasattr(store, "get_max_step_for_metric"):
-            return store.get_max_step_for_metric(run_id=run_id, metric_key=metric_key)
-        steps = [m.step for m in store.get_metric_history(run_id, metric_key)]
-        return max(steps) if steps else 0
-
     def _get_sampled_steps(run_ids, metric_key, max_results):
         # cannot fetch from request_message as the default value is 0
         start_step = args.get("start_step")
         end_step = args.get("end_step")
-        if start_step is None and end_step is None:
-            max_steps_per_run = [_get_max_step_for_metric(run_id, metric_key) for run_id in run_ids]
-            max_steps = max(max_steps_per_run)
-            # Get sampled steps and append the max step for each run.
-            sampled_steps = _get_sampled_steps_from_steps(0, max_steps, max_results)
-            return list(set(sampled_steps).union(max_steps_per_run))
-        elif start_step is not None and end_step is not None:
+
+        # perform validation before any data fetching occurs
+        if start_step is not None and end_step is not None:
             start_step = int(start_step)
             end_step = int(end_step)
             if start_step > end_step:
@@ -1197,12 +1277,35 @@ def get_metric_history_bulk_interval_handler():
                     "end_step must be greater than start_step. "
                     f"Found start_step={start_step} and end_step={end_step}."
                 )
-            sampled_steps = _get_sampled_steps_from_steps(start_step, end_step, max_results)
-            return list(set(sampled_steps).union([end_step]))
-        else:
+        elif start_step is not None or end_step is not None:
             raise MlflowException.invalid_parameter_value(
                 "If either start step or end step are specified, both must be specified."
             )
+
+        # get a list of all steps for all runs. this is necessary
+        # because we can't assume that every step was logged, so
+        # sampling needs to be done on the steps that actually exist
+        all_runs = [
+            [m.step for m in store.get_metric_history(run_id, metric_key)] for run_id in run_ids
+        ]
+
+        # save mins and maxes to be added back later
+        all_mins_and_maxes = {step for run in all_runs if run for step in [min(run), max(run)]}
+        all_steps = sorted({step for sublist in all_runs for step in sublist})
+
+        # init start and end step if not provided in args
+        if start_step is None and end_step is None:
+            start_step = 0
+            end_step = all_steps[-1] if all_steps else 0
+
+        # remove any steps outside of the range
+        all_mins_and_maxes = {step for step in all_mins_and_maxes if start_step <= step <= end_step}
+
+        # doing extra iterations here shouldn't badly affect performance,
+        # since the number of steps at this point should be relatively small
+        # (MAX_RESULTS_PER_RUN + len(all_mins_and_maxes))
+        sampled_steps = _get_sampled_steps_from_steps(start_step, end_step, max_results, all_steps)
+        return sorted(sampled_steps.union(all_mins_and_maxes))
 
     def _default_history_bulk_interval_impl():
         steps = _get_sampled_steps(run_ids, metric_key, max_results)
@@ -1222,17 +1325,25 @@ def get_metric_history_bulk_interval_handler():
 
     response_message = GetMetricHistoryBulkInterval.Response()
     response_message.metrics.extend([m.to_proto() for m in metrics_with_run_ids])
-    response = Response(mimetype="application/json")
-    response.set_data(message_to_json(response_message))
-    return response
+    return response_message
 
 
 @catch_mlflow_exception
 @_disable_if_artifacts_only
 def search_datasets_handler():
+    request_message = _get_request_message(
+        SearchDatasets(),
+    )
+    response_message = search_datasets_impl(request_message)
+    response = Response(mimetype="application/json")
+    response.set_data(message_to_json(response_message))
+    return response
+
+
+def search_datasets_impl(request_message):
     MAX_EXPERIMENT_IDS_PER_REQUEST = 20
     _validate_content_type(request, ["application/json"])
-    experiment_ids = request.json.get("experiment_ids", [])
+    experiment_ids = request_message.experiment_ids or []
     if not experiment_ids:
         raise MlflowException(
             message="SearchDatasets request must specify at least one experiment_id.",
@@ -1250,11 +1361,11 @@ def search_datasets_handler():
     store = _get_tracking_store()
 
     if hasattr(store, "_search_datasets"):
-        return {
-            "dataset_summaries": [
-                summary.to_dict() for summary in store._search_datasets(experiment_ids)
-            ]
-        }
+        response_message = SearchDatasets.Response()
+        response_message.dataset_summaries.extend(
+            [summary.to_proto() for summary in store._search_datasets(experiment_ids)]
+        )
+        return response_message
     else:
         return _not_implemented()
 
@@ -1460,14 +1571,18 @@ def _get_artifact_repo(run):
 @_disable_if_artifacts_only
 def _log_batch():
     def _assert_metrics_fields_present(metrics):
-        for m in metrics:
-            _assert_required(m.get("key"))
-            _assert_required(m.get("value"))
-            _assert_required(m.get("timestamp"))
+        for idx, m in enumerate(metrics):
+            _assert_required(m.get("key"), path=f"metrics[{idx}].key")
+            _assert_required(m.get("value"), path=f"metrics[{idx}].value")
+            _assert_required(m.get("timestamp"), path=f"metrics[{idx}].timestamp")
 
-    def _assert_params_tags_fields_present(params_or_tags):
-        for param_or_tag in params_or_tags:
-            _assert_required(param_or_tag.get("key"))
+    def _assert_params_fields_present(params):
+        for idx, param in enumerate(params):
+            _assert_required(param.get("key"), path=f"params[{idx}].key")
+
+    def _assert_tags_fields_present(tags):
+        for idx, tag in enumerate(tags):
+            _assert_required(tag.get("key"), path=f"tags[{idx}].key")
 
     _validate_batch_log_api_req(_get_request_json())
     request_message = _get_request_message(
@@ -1475,8 +1590,8 @@ def _log_batch():
         schema={
             "run_id": [_assert_string, _assert_required],
             "metrics": [_assert_array, _assert_metrics_fields_present],
-            "params": [_assert_array, _assert_params_tags_fields_present],
-            "tags": [_assert_array, _assert_params_tags_fields_present],
+            "params": [_assert_array, _assert_params_fields_present],
+            "tags": [_assert_array, _assert_tags_fields_present],
         },
     )
     metrics = [Metric.from_proto(proto_metric) for proto_metric in request_message.metrics]
@@ -1570,7 +1685,10 @@ def _get_registered_model():
 def _update_registered_model():
     request_message = _get_request_message(
         UpdateRegisteredModel(),
-        schema={"name": [_assert_string, _assert_required], "description": [_assert_string]},
+        schema={
+            "name": [_assert_string, _assert_required],
+            "description": [_assert_string],
+        },
     )
     name = request_message.name
     new_description = request_message.description
@@ -1617,7 +1735,10 @@ def _search_registered_models():
         SearchRegisteredModels(),
         schema={
             "filter": [_assert_string],
-            "max_results": [_assert_intlike, lambda x: _assert_less_than_or_equal(int(x), 1000)],
+            "max_results": [
+                _assert_intlike,
+                lambda x: _assert_less_than_or_equal(int(x), 1000),
+            ],
             "order_by": [_assert_array, _assert_item_type_string],
             "page_token": [_assert_string],
         },
@@ -1713,7 +1834,7 @@ def _validate_non_local_source_contains_relative_paths(source: str):
     while (unquoted := urllib.parse.unquote_plus(source)) != source:
         source = unquoted
     source_path = re.sub(r"/+", "/", urllib.parse.urlparse(source).path.rstrip("/"))
-    if "\x00" in source_path:
+    if "\x00" in source_path or any(p == ".." for p in source.split("/")):
         raise MlflowException(invalid_source_error_message, INVALID_PARAMETER_VALUE)
     resolved_source = pathlib.Path(source_path).resolve().as_posix()
     # NB: drive split is specifically for Windows since WindowsPath.resolve() will append the
@@ -1781,13 +1902,9 @@ def _create_model_version():
 @catch_mlflow_exception
 @_disable_if_artifacts_only
 def get_model_version_artifact_handler():
-    from querystring_parser import parser
-
-    query_string = request.query_string.decode("utf-8")
-    request_dict = parser.parse(query_string, normalized=True)
-    name = request_dict.get("name")
-    version = request_dict.get("version")
-    path = request_dict["path"]
+    name = request.args.get("name")
+    version = request.args.get("version")
+    path = request.args["path"]
     path = validate_path_is_safe(path)
     artifact_uri = _get_model_registry_store().get_model_version_download_uri(name, version)
     if _is_servable_proxied_run_artifact_root(artifact_uri):
@@ -1836,7 +1953,9 @@ def _update_model_version():
     if request_message.HasField("description"):
         new_description = request_message.description
     model_version = _get_model_registry_store().update_model_version(
-        name=request_message.name, version=request_message.version, description=new_description
+        name=request_message.name,
+        version=request_message.version,
+        description=new_description,
     )
     return _wrap_response(UpdateModelVersion.Response(model_version=model_version.to_proto()))
 
@@ -1898,7 +2017,10 @@ def _search_model_versions():
         SearchModelVersions(),
         schema={
             "filter": [_assert_string],
-            "max_results": [_assert_intlike, lambda x: _assert_less_than_or_equal(int(x), 200_000)],
+            "max_results": [
+                _assert_intlike,
+                lambda x: _assert_less_than_or_equal(int(x), 200_000),
+            ],
             "order_by": [_assert_array, _assert_item_type_string],
             "page_token": [_assert_string],
         },
@@ -1953,7 +2075,9 @@ def _delete_model_version_tag():
         },
     )
     _get_model_registry_store().delete_model_version_tag(
-        name=request_message.name, version=request_message.version, key=request_message.key
+        name=request_message.name,
+        version=request_message.version,
+        key=request_message.key,
     )
     return _wrap_response(DeleteModelVersionTag.Response())
 
@@ -1970,7 +2094,9 @@ def _set_registered_model_alias():
         },
     )
     _get_model_registry_store().set_registered_model_alias(
-        name=request_message.name, alias=request_message.alias, version=request_message.version
+        name=request_message.name,
+        alias=request_message.alias,
+        version=request_message.version,
     )
     return _wrap_response(SetRegisteredModelAlias.Response())
 
@@ -2225,6 +2351,215 @@ def _abort_multipart_upload_artifact(artifact_path):
     return _wrap_response(AbortMultipartUpload.Response())
 
 
+# MLflow Tracing APIs
+
+
+@catch_mlflow_exception
+@_disable_if_artifacts_only
+def _start_trace():
+    """
+    A request handler for `POST /mlflow/traces` to create a new TraceInfo record in tracking store.
+    """
+    request_message = _get_request_message(
+        StartTrace(),
+        schema={
+            "experiment_id": [_assert_string],
+            "timestamp_ms": [_assert_intlike],
+            "request_metadata": [_assert_map_key_present],
+            "tags": [_assert_map_key_present],
+        },
+    )
+    request_metadata = {e.key: e.value for e in request_message.request_metadata}
+    tags = {e.key: e.value for e in request_message.tags}
+
+    trace_info = _get_tracking_store().start_trace(
+        experiment_id=request_message.experiment_id,
+        timestamp_ms=request_message.timestamp_ms,
+        request_metadata=request_metadata,
+        tags=tags,
+    )
+    response_message = StartTrace.Response(trace_info=trace_info.to_proto())
+    return _wrap_response(response_message)
+
+
+@catch_mlflow_exception
+@_disable_if_artifacts_only
+def _end_trace(request_id):
+    """
+    A request handler for `PATCH /mlflow/traces/{request_id}` to mark an existing TraceInfo
+    record completed in tracking store.
+    """
+    request_message = _get_request_message(
+        EndTrace(),
+        schema={
+            "timestamp_ms": [_assert_intlike],
+            "status": [_assert_string],
+            "request_metadata": [_assert_map_key_present],
+            "tags": [_assert_map_key_present],
+        },
+    )
+    request_metadata = {e.key: e.value for e in request_message.request_metadata}
+    tags = {e.key: e.value for e in request_message.tags}
+
+    trace_info = _get_tracking_store().end_trace(
+        request_id=request_id,
+        timestamp_ms=request_message.timestamp_ms,
+        status=TraceStatus.from_proto(request_message.status),
+        request_metadata=request_metadata,
+        tags=tags,
+    )
+    response_message = EndTrace.Response(trace_info=trace_info.to_proto())
+    return _wrap_response(response_message)
+
+
+@catch_mlflow_exception
+@_disable_if_artifacts_only
+def _get_trace_info(request_id):
+    """
+    A request handler for `GET /mlflow/traces/{request_id}/info` to retrieve
+    an existing TraceInfo record from tracking store.
+    """
+    trace_info = _get_tracking_store().get_trace_info(request_id)
+    response_message = GetTraceInfo.Response(trace_info=trace_info.to_proto())
+    return _wrap_response(response_message)
+
+
+@catch_mlflow_exception
+@_disable_if_artifacts_only
+def _search_traces():
+    """
+    A request handler for `GET /mlflow/traces` to search for TraceInfo records in tracking store.
+    """
+    request_message = _get_request_message(
+        SearchTraces(),
+        schema={
+            "experiment_ids": [
+                _assert_array,
+                _assert_item_type_string,
+                _assert_required,
+            ],
+            "filter": [_assert_string],
+            "max_results": [
+                _assert_intlike,
+                lambda x: _assert_less_than_or_equal(int(x), 500),
+            ],
+            "order_by": [_assert_array, _assert_item_type_string],
+            "page_token": [_assert_string],
+        },
+    )
+    traces, token = _get_tracking_store().search_traces(
+        experiment_ids=request_message.experiment_ids,
+        filter_string=request_message.filter,
+        max_results=request_message.max_results,
+        order_by=request_message.order_by,
+        page_token=request_message.page_token,
+    )
+    response_message = SearchTraces.Response()
+    response_message.traces.extend([e.to_proto() for e in traces])
+    if token:
+        response_message.next_page_token = token
+    return _wrap_response(response_message)
+
+
+@catch_mlflow_exception
+@_disable_if_artifacts_only
+def _delete_traces():
+    """
+    A request handler for `POST /mlflow/traces/delete-traces` to delete TraceInfo records
+    from tracking store.
+    """
+    request_message = _get_request_message(
+        DeleteTraces(),
+        schema={
+            "experiment_id": [_assert_string, _assert_required],
+            "max_timestamp_millis": [_assert_intlike],
+            "max_traces": [_assert_intlike],
+            "request_ids": [_assert_array, _assert_item_type_string],
+        },
+    )
+
+    # NB: Interestingly, the field accessor for the message object returns the default
+    #   value for optional field if it's not set. For example, `request_message.max_traces`
+    #   returns 0 if max_traces is not specified in the request. This is not desirable,
+    #   because null and 0 means completely opposite i.e. the former is 'delete nothing'
+    #   while the latter is 'delete all'. To handle this, we need to explicitly check
+    #   if the field is set or not using `HasField` method and return None if not.
+    def _get_nullable_field(field):
+        if request_message.HasField(field):
+            return getattr(request_message, field)
+        return None
+
+    traces_deleted = _get_tracking_store().delete_traces(
+        experiment_id=request_message.experiment_id,
+        max_timestamp_millis=_get_nullable_field("max_timestamp_millis"),
+        max_traces=_get_nullable_field("max_traces"),
+        request_ids=request_message.request_ids,
+    )
+    return _wrap_response(DeleteTraces.Response(traces_deleted=traces_deleted))
+
+
+@catch_mlflow_exception
+@_disable_if_artifacts_only
+def _set_trace_tag(request_id):
+    """
+    A request handler for `PATCH /mlflow/traces/{request_id}/tags` to set tags on a TraceInfo record
+    """
+    request_message = _get_request_message(
+        SetTraceTag(),
+        schema={
+            "key": [_assert_string, _assert_required],
+            "value": [_assert_string],
+        },
+    )
+    _get_tracking_store().set_trace_tag(request_id, request_message.key, request_message.value)
+    return _wrap_response(SetTraceTag.Response())
+
+
+@catch_mlflow_exception
+@_disable_if_artifacts_only
+def _delete_trace_tag(request_id):
+    """
+    A request handler for `DELETE /mlflow/traces/{request_id}/tags` to delete tags from a TraceInfo
+    record.
+    """
+    request_message = _get_request_message(
+        DeleteTraceTag(),
+        schema={
+            "key": [_assert_string, _assert_required],
+        },
+    )
+    _get_tracking_store().delete_trace_tag(request_id, request_message.key)
+    return _wrap_response(DeleteTraceTag.Response())
+
+
+@catch_mlflow_exception
+@_disable_if_artifacts_only
+def get_trace_artifact_handler():
+    request_id = request.args.get("request_id")
+
+    if not request_id:
+        raise MlflowException(
+            'Request must include the "request_id" query parameter.',
+            error_code=BAD_REQUEST,
+        )
+
+    trace_info = _get_tracking_store().get_trace_info(request_id)
+    trace_data = _get_trace_artifact_repo(trace_info).download_trace_data()
+
+    # Write data to a BytesIO buffer instead of needing to save a temp file
+    buf = io.BytesIO()
+    buf.write(json.dumps(trace_data).encode())
+    buf.seek(0)
+
+    file_sender_response = send_file(
+        buf,
+        mimetype="application/octet-stream",
+        as_attachment=True,
+        download_name=TRACE_DATA_FILE_NAME,
+    )
+    return _response_with_file_attachment_headers(TRACE_DATA_FILE_NAME, file_sender_response)
+
+
 def _get_rest_path(base_path):
     return f"/api/2.0{base_path}"
 
@@ -2246,7 +2581,20 @@ def _get_paths(base_path):
     We should register paths like /api/2.0/mlflow/experiment and
     /ajax-api/2.0/mlflow/experiment in the Flask router.
     """
+    base_path = _convert_path_parameter_to_flask_format(base_path)
     return [_get_rest_path(base_path), _get_ajax_path(base_path)]
+
+
+def _convert_path_parameter_to_flask_format(path):
+    """
+    Converts path parameter format to Flask compatible format.
+
+    Some protobuf endpoint paths contain parameters like /mlflow/trace/{request_id}.
+    This can be interpreted correctly by gRPC framework like Armeria, but Flask does
+    not understand it. Instead, we need to specify it with a different format,
+    like /mlflow/trace/<request_id>.
+    """
+    return re.sub(r"{(\w+)}", r"<\1>", path)
 
 
 def get_handler(request_class):
@@ -2337,4 +2685,12 @@ HANDLERS = {
     CreateMultipartUpload: _create_multipart_upload_artifact,
     CompleteMultipartUpload: _complete_multipart_upload_artifact,
     AbortMultipartUpload: _abort_multipart_upload_artifact,
+    # MLflow Tracing APIs
+    StartTrace: _start_trace,
+    EndTrace: _end_trace,
+    GetTraceInfo: _get_trace_info,
+    SearchTraces: _search_traces,
+    DeleteTraces: _delete_traces,
+    SetTraceTag: _set_trace_tag,
+    DeleteTraceTag: _delete_trace_tag,
 }

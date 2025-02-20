@@ -7,13 +7,12 @@ import {
   Spacer,
   TableIcon,
   Tag,
-  Tooltip,
+  LegacyTooltip,
   Typography,
   useDesignSystemTheme,
 } from '@databricks/design-system';
 import type { RunDatasetWithTags } from '../../../../types';
 import { MLFLOW_RUN_DATASET_CONTEXT_TAG } from '../../../../constants';
-import { Divider } from 'antd';
 import { ExperimentViewDatasetSchema } from './ExperimentViewDatasetSchema';
 import { ExperimentViewDatasetLink } from './ExperimentViewDatasetLink';
 import { Link } from '../../../../../common/utils/RoutingUtils';
@@ -24,6 +23,9 @@ import { RunColorPill } from '../RunColorPill';
 import { ExperimentViewDatasetSourceType } from './ExperimentViewDatasetSourceType';
 import { ExperimentViewDatasetSourceURL } from './ExperimentViewDatasetSourceURL';
 import { ExperimentViewDatasetDigest } from './ExperimentViewDatasetDigest';
+import { useSelector } from 'react-redux';
+import { ReduxState } from '../../../../../redux-types';
+import { useGetExperimentRunColor } from '../../hooks/useExperimentRunColor';
 
 export type DatasetWithRunType = {
   datasetWithTags: RunDatasetWithTags;
@@ -32,7 +34,6 @@ export type DatasetWithRunType = {
     tags?: Record<string, { key: string; value: string }>;
     runUuid: string;
     runName?: string;
-    color?: string;
     datasets: RunDatasetWithTags[];
   };
 };
@@ -47,7 +48,7 @@ export interface DatasetsCellRendererProps {
 const DRAWER_WITDH = '800px';
 const MAX_PROFILE_LENGTH = 80;
 
-export const ExperimentViewDatasetDrawerImpl = ({
+const ExperimentViewDatasetDrawerImpl = ({
   isOpen,
   setIsOpen,
   selectedDatasetWithRun,
@@ -63,6 +64,7 @@ export const ExperimentViewDatasetDrawerImpl = ({
       ? datasetWithTags.dataset.profile
       : undefined;
 
+  const getRunColor = useGetExperimentRunColor();
   const { experimentId = '', tags = {} } = runData;
 
   return (
@@ -75,6 +77,7 @@ export const ExperimentViewDatasetDrawerImpl = ({
       }}
     >
       <Drawer.Content
+        componentId="codegen_mlflow_app_src_experiment-tracking_components_experiment-page_components_runs_experimentviewdatasetdrawer.tsx_81"
         title={
           <div css={{ display: 'flex', alignItems: 'center', height: '100%' }}>
             <Typography.Title level={4} css={{ marginRight: theme.spacing.sm, marginBottom: 0 }}>
@@ -84,7 +87,7 @@ export const ExperimentViewDatasetDrawerImpl = ({
               />
             </Typography.Title>
             <Link to={Routes.getRunPageRoute(experimentId, runData.runUuid)} css={styles.runLink}>
-              <RunColorPill color={runData.color} />
+              <RunColorPill color={getRunColor(runData.runUuid)} />
               <span css={styles.runName}>{runData.runName}</span>
             </Link>
           </div>
@@ -193,13 +196,14 @@ export const ExperimentViewDatasetDrawerImpl = ({
                   title={
                     <div css={{ display: 'flex', flexDirection: 'row', alignItems: 'center' }}>
                       <TableIcon css={{ marginRight: theme.spacing.xs }} />
-                      <Tooltip title={datasetWithTags.dataset.name}>
+                      <LegacyTooltip title={datasetWithTags.dataset.name}>
                         <Typography.Title ellipsis level={3} css={{ marginBottom: 0, maxWidth: 200 }}>
                           {datasetWithTags.dataset.name}
                         </Typography.Title>
-                      </Tooltip>
+                      </LegacyTooltip>
                       {contextTag && (
                         <Tag
+                          componentId="codegen_mlflow_app_src_experiment-tracking_components_experiment-page_components_runs_experimentviewdatasetdrawer.tsx_206"
                           css={{
                             textTransform: 'capitalize',
                             marginLeft: theme.spacing.xs,
@@ -240,7 +244,14 @@ export const ExperimentViewDatasetDrawerImpl = ({
               <ExperimentViewDatasetSourceURL datasetWithTags={datasetWithTags} />
             </div>
             {/* dataset schema */}
-            <Divider css={{ marginTop: theme.spacing.sm, marginBottom: theme.spacing.xs }} />
+            <div
+              css={{
+                marginTop: theme.spacing.sm,
+                marginBottom: theme.spacing.xs,
+                borderTop: `1px solid ${theme.colors.border}`,
+                opacity: 0.5,
+              }}
+            />
             <ExperimentViewDatasetSchema datasetWithTags={datasetWithTags} />
           </div>
         </div>

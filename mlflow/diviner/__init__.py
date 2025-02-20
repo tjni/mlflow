@@ -15,11 +15,12 @@ Diviner format
 .. _Diviner:
     https://databricks-diviner.readthedocs.io/en/latest/index.html
 """
+
 import logging
 import os
 import pathlib
 import shutil
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 import pandas as pd
 import yaml
@@ -30,6 +31,7 @@ from mlflow.environment_variables import MLFLOW_DFS_TMP
 from mlflow.exceptions import MlflowException
 from mlflow.models import Model, ModelInputExample, ModelSignature
 from mlflow.models.model import MLMODEL_FILE_NAME
+from mlflow.models.signature import _infer_signature_from_input_example
 from mlflow.models.utils import _save_example
 from mlflow.protos.databricks_pb2 import INVALID_PARAMETER_VALUE
 from mlflow.tracking._model_registry import DEFAULT_AWAIT_MAX_SLEEP_SECONDS
@@ -67,8 +69,6 @@ _MODEL_BINARY_FILE_NAME = "model.div"
 _MODEL_TYPE_KEY = "model_type"
 _FLAVOR_KEY = "flavors"
 _SPARK_MODEL_INDICATOR = "fit_with_spark"
-
-model_data_artifact_paths = [_MODEL_BINARY_FILE_NAME]
 
 _logger = logging.getLogger(__name__)
 
@@ -113,9 +113,7 @@ def save_model(
             ``DataFrame``.
         path: Local path destination for the serialized model is to be saved.
         conda_env: {{ conda_env }}
-        code_paths: A list of local filesystem paths to Python file dependencies (or directories
-            containing file dependencies). These files are *prepended* to the system
-            path when the model is loaded.
+        code_paths: {{ code_paths }}
         mlflow_model: :py:mod:`mlflow.models.Model` the flavor that this model is being added to.
         signature: :py:class:`Model Signature <mlflow.models.ModelSignature>` describes model
             input and output :py:class:`Schema <mlflow.types.Schema>`. The model
@@ -135,11 +133,7 @@ def save_model(
         input_example: {{ input_example }}
         pip_requirements: {{ pip_requirements }}
         extra_pip_requirements: {{ extra_pip_requirements }}
-        metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
-
-            .. Note:: Experimental: This parameter may change or be removed in a future
-                release without warning.
-
+        metadata: {{ metadata }}
         kwargs: Optional configurations for Spark DataFrame storage iff the model has
             been fit in Spark.
             Current supported options:
@@ -165,10 +159,13 @@ def save_model(
 
     if mlflow_model is None:
         mlflow_model = Model()
+    saved_example = _save_example(mlflow_model, input_example, str(path))
+    if signature is None and saved_example is not None:
+        wrapped_model = _DivinerModelWrapper(diviner_model)
+        signature = _infer_signature_from_input_example(saved_example, wrapped_model)
+
     if signature is not None:
         mlflow_model.signature = signature
-    if input_example is not None:
-        _save_example(mlflow_model, input_example, str(path))
     if metadata is not None:
         mlflow_model.metadata = metadata
 
@@ -374,9 +371,7 @@ def log_model(
         diviner_model: ``Diviner`` model that has been ``fit`` on a grouped temporal ``DataFrame``.
         artifact_path: Run-relative artifact path to save the model instance to.
         conda_env: {{ conda_env }}
-        code_paths: A list of local filesystem paths to Python file dependencies (or directories
-            containing file dependencies). These files are *prepended* to the system
-            path when the model is loaded.
+        code_paths: {{ code_paths }}
         registered_model_name: This argument may change or be removed in a
             future release without warning. If given, create a model
             version under ``registered_model_name``, also creating a
@@ -411,11 +406,7 @@ def log_model(
             Specify 0 or None to skip waiting.
         pip_requirements: {{ pip_requirements }}
         extra_pip_requirements: {{ extra_pip_requirements }}
-        metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
-
-            .. Note:: Experimental: This parameter may change or be removed in a future
-                release without warning.
-
+        metadata: {{ metadata }}
         kwargs: Additional arguments for :py:class:`mlflow.models.model.Model`
             Additionally, for models that have been fit in Spark, the following supported
             configuration options are available to set.
@@ -454,7 +445,13 @@ class _DivinerModelWrapper:
     def __init__(self, diviner_model):
         self.diviner_model = diviner_model
 
-    def predict(self, dataframe, params: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+    def get_raw_model(self):
+        """
+        Returns the underlying model.
+        """
+        return self.diviner_model
+
+    def predict(self, dataframe, params: Optional[dict[str, Any]] = None) -> pd.DataFrame:
         """A method that allows a pyfunc implementation of this flavor to generate forecasted values
         from the end of a trained Diviner model's training series per group.
 
@@ -487,9 +484,6 @@ class _DivinerModelWrapper:
                 Will generate 30 days of forecasted values for each group that the model
                 was trained on.
             params: Additional parameters to pass to the model for inference.
-
-                .. Note:: Experimental: This parameter may change or be removed in a future
-                    release without warning.
 
         Returns:
             A Pandas DataFrame containing the forecasted values for each group key that was
@@ -544,7 +538,7 @@ class _DivinerModelWrapper:
         predict_col = conf.get("predict_col", None)
         predict_groups = conf.get("groups", None)
 
-        if predict_groups and not isinstance(predict_groups, List):
+        if predict_groups and not isinstance(predict_groups, list):
             raise MlflowException(
                 "Specifying a group subset for prediction requires groups to be defined as a "
                 f"[List[(Tuple|List)[<group_keys>]]. Submitted group type: {type(predict_groups)}.",
@@ -554,7 +548,7 @@ class _DivinerModelWrapper:
         # NB: json serialization of a tuple converts the tuple to a List. Diviner requires a
         # List of Tuples to be input to the group_prediction API. This conversion is for utilizing
         # the pyfunc flavor through the serving API.
-        if predict_groups and not isinstance(predict_groups[0], Tuple):
+        if predict_groups and not isinstance(predict_groups[0], tuple):
             predict_groups = [tuple(group) for group in predict_groups]
 
         if isinstance(self.diviner_model, GroupedProphet):

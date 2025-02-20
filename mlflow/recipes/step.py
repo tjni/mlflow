@@ -5,7 +5,7 @@ import os
 import time
 import traceback
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 import yaml
 
@@ -70,7 +70,7 @@ class StepExecutionState:
         self.last_updated_timestamp = last_updated_timestamp
         self.stack_trace = stack_trace
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """
         Creates a dictionary representation of the step execution state.
         """
@@ -99,7 +99,7 @@ class BaseStep(metaclass=abc.ABCMeta):
 
     _EXECUTION_STATE_FILE_NAME = "execution_state.json"
 
-    def __init__(self, step_config: Dict[str, Any], recipe_root: str):
+    def __init__(self, step_config: dict[str, Any], recipe_root: str):
         """
         Args:
             step_config: Dictionary of the config needed to run/implement the step.
@@ -181,7 +181,6 @@ class BaseStep(metaclass=abc.ABCMeta):
         Returns:
             A BaseCard containing step execution information.
         """
-        pass
 
     @abc.abstractmethod
     def _validate_and_apply_step_config(self) -> None:
@@ -189,11 +188,10 @@ class BaseStep(metaclass=abc.ABCMeta):
         This function is responsible for validating and loading the step config for
         a particular step. It is invoked by the internal step runner.
         """
-        pass
 
     @classmethod
     @abc.abstractmethod
-    def from_recipe_config(cls, recipe_config: Dict[str, Any], recipe_root: str) -> "BaseStep":
+    def from_recipe_config(cls, recipe_config: dict[str, Any], recipe_root: str) -> "BaseStep":
         """
         Constructs a step class instance by creating a step config using the recipe
         config.
@@ -207,7 +205,6 @@ class BaseStep(metaclass=abc.ABCMeta):
         Returns:
             class instance of the step.
         """
-        pass
 
     @classmethod
     def from_step_config_path(cls, step_config_path: str, recipe_root: str) -> "BaseStep":
@@ -235,17 +232,16 @@ class BaseStep(metaclass=abc.ABCMeta):
         Returns back the name of the step for the current class instance. This is used
         downstream by the execution engine to create step-specific directory structures.
         """
-        pass
 
     @property
-    def environment(self) -> Dict[str, str]:
+    def environment(self) -> dict[str, str]:
         """
         Returns environment variables associated with step that should be set when the
         step is executed.
         """
         return {}
 
-    def get_artifacts(self) -> List[Any]:
+    def get_artifacts(self) -> list[Any]:
         """
         Returns the named artifacts produced by the step for the current class instance.
         """
@@ -256,7 +252,6 @@ class BaseStep(metaclass=abc.ABCMeta):
         """
         Returns the step class.
         """
-        pass
 
     def get_execution_state(self, output_directory: str) -> StepExecutionState:
         """

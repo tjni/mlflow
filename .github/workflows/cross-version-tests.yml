@@ -1,4 +1,5 @@
 name: Cross version tests
+run-name: ${{ inputs.uuid }}
 
 on:
   pull_request:
@@ -30,12 +31,13 @@ on:
         description: "[Optional] Comma-separated string specifying which versions to test (e.g. '1.2.3, 4.5.6'). If unspecified, all versions are tested."
         required: false
         default: ""
+      uuid:
+        description: "[Optional] A unique identifier for this run."
+        required: false
+        default: ""
   schedule:
     # Run this workflow daily at 13:00 UTC
     - cron: "0 13 * * *"
-
-permissions:
-  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
@@ -57,8 +59,10 @@ jobs:
     permissions:
       issues: read # listLabelsOnIssue
     outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-      is_matrix_empty: ${{ steps.set-matrix.outputs.is_matrix_empty }}
+      matrix1: ${{ steps.set-matrix.outputs.matrix1 }}
+      matrix2: ${{ steps.set-matrix.outputs.matrix2 }}
+      is_matrix1_empty: ${{ steps.set-matrix.outputs.is_matrix1_empty }}
+      is_matrix2_empty: ${{ steps.set-matrix.outputs.is_matrix2_empty }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -106,7 +110,7 @@ jobs:
             PR_NUMBER="${{ github.event.pull_request.number }}"
             BASE_REF="${{ github.base_ref }}"
             REF_VERSIONS_YAML="https://raw.githubusercontent.com/$REPO/$BASE_REF/mlflow/ml-package-versions.yml"
-            CHANGED_FILES="$(python dev/list_changed_files.py --repository $REPO --pr-num $PR_NUMBER)"
+            CHANGED_FILES="$(python dev/list_changed_files.py --repository $REPO --pr-num $PR_NUMBER | grep -v '^mlflow/server/js')"
             ENABLE_DEV_TESTS="${{ fromJson(steps.check-labels.outputs.result).enable_dev_tests }}"
             NO_DEV_FLAG=$([ "$ENABLE_DEV_TESTS" == "true" ] && echo "" || echo "--no-dev")
             ONLY_LATEST="${{ fromJson(steps.check-labels.outputs.result).only_latest }}"
@@ -117,14 +121,16 @@ jobs:
           else
             python dev/set_matrix.py
           fi
-  test:
+
+  test1:
     needs: set-matrix
-    if: ${{ needs.set-matrix.outputs.is_matrix_empty == 'false' }}
-    runs-on: ubuntu-latest
+    if: ${{ needs.set-matrix.outputs.is_matrix1_empty == 'false' }}
+    runs-on: ${{ matrix.runs_on }}
     timeout-minutes: 120
+    permissions: {}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.set-matrix.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.set-matrix.outputs.matrix1) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -140,7 +146,6 @@ jobs:
       - uses: ./.github/actions/setup-java
         with:
           java-version: ${{ matrix.java }}
-          distribution: "adopt"
       - name: Install mlflow & test dependencies
         run: |
           pip install wheel
@@ -149,14 +154,59 @@ jobs:
       - name: Install ${{ matrix.package }} ${{ matrix.version }}
         run: |
           ${{ matrix.install }}
-      - name: Check package versions
-        run: |
-          python dev/show_package_release_dates.py
+      - uses: ./.github/actions/show-versions
+      - uses: ./.github/actions/pipdeptree
       - name: Pre-test
         if: matrix.pre_test
         run: |
           ${{ matrix.pre_test }}
+      - name: Run tests
+        env:
+          MLFLOW_CONDA_HOME: /usr/share/miniconda
+          SPARK_LOCAL_IP: localhost
+          JOHNSNOWLABS_LICENSE_JSON: ${{ secrets.JOHNSNOWLABS_LICENSE_JSON }}
+          HF_HUB_ENABLE_HF_TRANSFER: 1
+        run: |
+          ${{ matrix.run }}
+
+  test2:
+    needs: set-matrix
+    if: ${{ needs.set-matrix.outputs.is_matrix2_empty == 'false' }}
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 120
+    permissions: {}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.set-matrix.outputs.matrix2) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          repository: ${{ github.event_name == 'schedule' && 'mlflow/mlflow' || github.event.inputs.repository }}
+          ref: ${{ github.event.inputs.ref }}
+      - uses: ./.github/actions/free-disk-space
+        if: matrix.free_disk_space
+      - uses: ./.github/actions/setup-python
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: ./.github/actions/setup-pyenv
+      - uses: ./.github/actions/setup-java
+        with:
+          java-version: ${{ matrix.java }}
+      - name: Install mlflow & test dependencies
+        run: |
+          pip install wheel
+          pip install .[extras]
+          pip install -r requirements/test-requirements.txt
+      - name: Install ${{ matrix.package }} ${{ matrix.version }}
+        run: |
+          ${{ matrix.install }}
+      - uses: ./.github/actions/show-versions
       - uses: ./.github/actions/pipdeptree
+      - name: Pre-test
+        if: matrix.pre_test
+        run: |
+          ${{ matrix.pre_test }}
       - name: Run tests
         env:
           MLFLOW_CONDA_HOME: /usr/share/miniconda

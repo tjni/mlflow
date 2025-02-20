@@ -15,7 +15,7 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Optional, Union
 
 import pandas as pd
 import yaml
@@ -107,7 +107,8 @@ def log_model(
     pip_requirements=None,
     extra_pip_requirements=None,
     metadata=None,
-    model_config: Optional[Dict[str, Any]] = None,
+    model_config: Optional[dict[str, Any]] = None,
+    example_no_conversion=None,
 ):
     """
     Log a Promptflow model as an MLflow artifact for the current run.
@@ -116,9 +117,7 @@ def log_model(
         model: A promptflow model loaded by `promptflow.load_flow()`.
         artifact_path: Run-relative artifact path.
         conda_env: {{ conda_env }}
-        code_paths: A list of local filesystem paths to Python file dependencies (or directories
-            containing file dependencies). These files are *prepended* to the system
-            path when the model is loaded.
+        code_paths: {{ code_paths }}
         registered_model_name: If given, create a model version under
             ``registered_model_name``, also creating a registered model if one
             with the given name does not exist.
@@ -129,10 +128,7 @@ def log_model(
             waits for five minutes. Specify 0 or None to skip waiting.
         pip_requirements: {{ pip_requirements }}
         extra_pip_requirements: {{ extra_pip_requirements }}
-        metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
-
-                        .. Note:: Experimental: This parameter may change or be removed in a future
-                                                release without warning.
+        metadata: {{ metadata }}
         model_config: A dict of valid overrides that can be applied to a flow instance
             during inference. These arguments are used exclusively for the case of loading
             the model as a ``pyfunc`` Model.
@@ -174,6 +170,7 @@ def log_model(
                     logged_model = mlflow.promptflow.log_model(
                         flow, artifact_path="promptflow_model", model_config=model_config
                     )
+        example_no_conversion: {{ example_no_conversion }}
 
     Returns
         A :py:class:`ModelInfo <mlflow.models.model.ModelInfo>` instance that contains the
@@ -194,6 +191,7 @@ def log_model(
         extra_pip_requirements=extra_pip_requirements,
         metadata=metadata,
         model_config=model_config,
+        example_no_conversion=example_no_conversion,
     )
 
 
@@ -210,7 +208,8 @@ def save_model(
     pip_requirements=None,
     extra_pip_requirements=None,
     metadata=None,
-    model_config: Optional[Dict[str, Any]] = None,
+    model_config: Optional[dict[str, Any]] = None,
+    example_no_conversion=None,
 ):
     """
     Save a Promptflow model to a path on the local file system.
@@ -219,18 +218,13 @@ def save_model(
         model: A promptflow model loaded by `promptflow.load_flow()`.
         path: Local path where the serialized model (as YAML) is to be saved.
         conda_env: {{ conda_env }}
-        code_paths: A list of local filesystem paths to Python file dependencies (or directories
-            containing file dependencies). These files are *prepended* to the system
-            path when the model is loaded.
+        code_paths: {{ code_paths }}
         mlflow_model: :py:mod:`mlflow.models.Model` this flavor is being added to.
         signature: {{ signature }}
         input_example: {{ input_example }}
         pip_requirements: {{ pip_requirements }}
         extra_pip_requirements: {{ extra_pip_requirements }}
-        metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
-
-                        .. Note:: Experimental: This parameter may change or be removed in a future
-                                                release without warning.
+        metadata: {{ metadata }}
         model_config: A dict of valid overrides that can be applied to a flow instance
             during inference. These arguments are used exclusively for the case of loading
             the model as a ``pyfunc`` Model.
@@ -272,6 +266,7 @@ def save_model(
                     logged_model = mlflow.promptflow.log_model(
                         flow, artifact_path="promptflow_model", model_config=model_config
                     )
+        example_no_conversion: {{ example_no_conversion }}
     """
     import promptflow
     from promptflow._sdk._mlflow import (
@@ -310,17 +305,16 @@ def save_model(
     # Get flow env in flow dag
     flow_env = _resolve_env_from_flow(model.flow_dag_path)
 
-    if signature is None and input_example is not None:
-        wrapped_model = _PromptflowModelWrapper(model)
-        signature = _infer_signature_from_input_example(input_example, wrapped_model)
-
     if mlflow_model is None:
         mlflow_model = Model()
+    saved_example = _save_example(mlflow_model, input_example, path, example_no_conversion)
+
+    if signature is None and saved_example is not None:
+        wrapped_model = _PromptflowModelWrapper(model)
+        signature = _infer_signature_from_input_example(saved_example, wrapped_model)
+
     if signature is not None:
         mlflow_model.signature = signature
-
-    if input_example is not None:
-        _save_example(mlflow_model, input_example, path)
     if metadata is not None:
         mlflow_model.metadata = metadata
 
@@ -381,14 +375,14 @@ def _resolve_env_from_flow(flow_dag_path):
     environment = flow_dict.get("environment", {})
     if _FLOW_ENV_REQUIREMENTS in environment:
         # Append entry path to requirements
-        environment[
-            _FLOW_ENV_REQUIREMENTS
-        ] = f"{_MODEL_FLOW_DIRECTORY}/{environment[_FLOW_ENV_REQUIREMENTS]}"
+        environment[_FLOW_ENV_REQUIREMENTS] = (
+            f"{_MODEL_FLOW_DIRECTORY}/{environment[_FLOW_ENV_REQUIREMENTS]}"
+        )
     return environment
 
 
 class _PromptflowModelWrapper:
-    def __init__(self, model, model_config: Optional[Dict[str, Any]] = None):
+    def __init__(self, model, model_config: Optional[dict[str, Any]] = None):
         from promptflow._sdk._mlflow import FlowInvoker
 
         self.model = model
@@ -404,10 +398,16 @@ class _PromptflowModelWrapper:
             connections_name_overrides=connection_overrides,
         )
 
+    def get_raw_model(self):
+        """
+        Returns the underlying model.
+        """
+        return self.model
+
     def predict(  # pylint: disable=unused-argument
         self,
-        data: Union[pd.DataFrame, List[Union[str, Dict[str, Any]]]],
-        params: Optional[Dict[str, Any]] = None,  # pylint: disable=unused-argument
+        data: Union[pd.DataFrame, list[Union[str, dict[str, Any]]]],
+        params: Optional[dict[str, Any]] = None,  # pylint: disable=unused-argument
     ) -> Union[dict, list]:
         """
         Args:
@@ -419,9 +419,6 @@ class _PromptflowModelWrapper:
                         print(loaded_model.predict({"text": "Python Hello World!"}))
 
             params: Additional parameters to pass to the model for inference.
-
-                       .. Note:: Experimental: This parameter may change or be removed in a future
-                                               release without warning.
 
         Returns
             Model predictions. Dict type, example ``{"output": "\n\nprint('Hello World!')"}``
@@ -440,7 +437,7 @@ class _PromptflowModelWrapper:
         raise mlflow.MlflowException.invalid_parameter_value(_INVALID_PREDICT_INPUT_ERROR_MESSAGE)
 
 
-def _load_pyfunc(path, model_config: Optional[Dict[str, Any]] = None):
+def _load_pyfunc(path, model_config: Optional[dict[str, Any]] = None):  # noqa: D417
     """
     Load PyFunc implementation for Promptflow. Called by ``pyfunc.load_model``.
 

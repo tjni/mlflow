@@ -6,7 +6,7 @@ from mlflow.utils.autologging_utils import ExceptionSafeClass
 from mlflow.utils.checkpoint_utils import MlflowModelCheckpointCallbackBase
 
 
-class MLflowCallback(keras.callbacks.Callback, metaclass=ExceptionSafeClass):
+class MlflowCallback(keras.callbacks.Callback, metaclass=ExceptionSafeClass):
     """Callback for logging Tensorflow training metrics to MLflow.
 
     This callback logs model information at training start, and logs training metrics every epoch or
@@ -49,7 +49,7 @@ class MLflowCallback(keras.callbacks.Callback, metaclass=ExceptionSafeClass):
                 label,
                 batch_size=4,
                 epochs=2,
-                callbacks=[MLflowCallback(run)],
+                callbacks=[mlflow.keras.MlflowCallback(run)],
             )
     """
 
@@ -207,7 +207,7 @@ class MlflowModelCheckpointCallback(Callback, MlflowModelCheckpointCallbackBase)
 
     def on_train_batch_end(self, batch, logs=None):
         # Note that `on_train_batch_end` might be invoked by every N train steps,
-        # (controlled by `steps_per_execution` argument in `model.comple` method).
+        # (controlled by `steps_per_execution` argument in `model.compile` method).
         # the following logic is similar to
         # https://github.com/keras-team/keras/blob/e6e62405fa1b4444102601636d871610d91e5783/keras/callbacks/model_checkpoint.py#L212
         add_batches = batch + 1 if batch <= self._last_batch_seen else batch - self._last_batch_seen
