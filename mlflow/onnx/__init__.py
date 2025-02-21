@@ -7,10 +7,11 @@ ONNX (native) format
 :py:mod:`mlflow.pyfunc`
     Produced for use by generic pyfunc-based deployment tools and batch inference.
 """
+
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -54,8 +55,6 @@ _logger = logging.getLogger(__name__)
 
 
 _MODEL_DATA_SUBPATH = "model.onnx"
-
-model_data_artifact_paths = [_MODEL_DATA_SUBPATH]
 
 
 def get_default_pip_requirements():
@@ -111,9 +110,7 @@ def save_model(
         onnx_model: ONNX model to be saved.
         path: Local path where the model is to be saved.
         conda_env: {{ conda_env }}
-        code_paths: A list of local filesystem paths to Python file dependencies (or directories
-            containing file dependencies). These files are *prepended* to the system
-            path when the model is loaded.
+        code_paths: {{ code_paths }}
         mlflow_model: :py:mod:`mlflow.models.Model` this flavor is being added to.
         signature: :py:class:`ModelSignature <mlflow.models.ModelSignature>`
             describes model input and output :py:class:`Schema <mlflow.types.Schema>`.
@@ -150,11 +147,8 @@ def save_model(
             'execution_mode' can be set to 'sequential' or 'parallel'.
             See onnxruntime API for further descriptions:
             https://onnxruntime.ai/docs/api/python/api_summary.html#sessionoptions
-        metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
+        metadata: {{ metadata }}
         save_as_external_data: Save tensors to external file(s).
-
-            .. Note:: Experimental: This parameter may change or be removed in a future
-                                    release without warning.
     """
     import onnx
 
@@ -317,6 +311,12 @@ class _OnnxModelWrapper:
         self.inputs = [(inp.name, inp.type) for inp in self.rt.get_inputs()]
         self.output_names = [outp.name for outp in self.rt.get_outputs()]
 
+    def get_raw_model(self):
+        """
+        Returns the underlying model.
+        """
+        return self.rt
+
     def _cast_float64_to_float32(self, feeds):
         for input_name, input_type in self.inputs:
             if input_type == "tensor(float)":
@@ -325,7 +325,7 @@ class _OnnxModelWrapper:
                     feeds[input_name] = feed.astype(np.float32)
         return feeds
 
-    def predict(self, data, params: Optional[Dict[str, Any]] = None):
+    def predict(self, data, params: Optional[dict[str, Any]] = None):
         """
         Args:
             data: Either a pandas DataFrame, numpy.ndarray or a dictionary.
@@ -346,9 +346,6 @@ class _OnnxModelWrapper:
                 For more information about the ONNX Runtime, see
                 `<https://github.com/microsoft/onnxruntime>`_.
             params: Additional parameters to pass to the model for inference.
-
-                .. Note:: Experimental: This parameter may change or be removed in a future
-                                        release without warning.
 
         Returns:
             Model predictions. If the input is a pandas.DataFrame, the predictions are returned
@@ -472,9 +469,7 @@ def log_model(
         onnx_model: ONNX model to be saved.
         artifact_path: Run-relative artifact path.
         conda_env: {{ conda_env }}
-        code_paths: A list of local filesystem paths to Python file dependencies (or directories
-            containing file dependencies). These files are *prepended* to the system
-            path when the model is loaded.
+        code_paths: {{ code_paths }}
         registered_model_name: If given, create a model version under
             ``registered_model_name``, also creating a registered model if one
             with the given name does not exist.
@@ -516,11 +511,8 @@ def log_model(
             'execution_mode' can be set to 'sequential' or 'parallel'.
             See onnxruntime API for further descriptions:
             https://onnxruntime.ai/docs/api/python/api_summary.html#sessionoptions
-        metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
+        metadata: {{ metadata }}
         save_as_external_data: Save tensors to external file(s).
-
-            .. Note:: Experimental: This parameter may change or be removed in a future
-                                    release without warning.
 
     Returns:
         A :py:class:`ModelInfo <mlflow.models.model.ModelInfo>` instance that contains the

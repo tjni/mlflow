@@ -1,4 +1,5 @@
 import ctypes
+import json
 import logging
 import os
 import pathlib
@@ -12,9 +13,8 @@ from pathlib import Path
 
 from mlflow import pyfunc
 from mlflow.exceptions import MlflowException
-from mlflow.models import FlavorBackend, docker_utils
+from mlflow.models import FlavorBackend, Model, docker_utils
 from mlflow.models.docker_utils import PYTHON_SLIM_BASE_IMAGE, UBUNTU_BASE_IMAGE
-from mlflow.models.model import MLMODEL_FILE_NAME, Model
 from mlflow.pyfunc import (
     ENV,
     _extract_conda_env,
@@ -23,9 +23,9 @@ from mlflow.pyfunc import (
     scoring_server,
 )
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
-from mlflow.utils import env_manager as _EnvManager
+from mlflow.utils import env_manager as em
 from mlflow.utils.conda import get_conda_bin_executable, get_or_create_conda_env
-from mlflow.utils.environment import Environment, _PythonEnv
+from mlflow.utils.environment import Environment, _get_pip_install_mlflow, _PythonEnv
 from mlflow.utils.file_utils import (
     TempDir,
     get_or_create_nfs_tmp_dir,
@@ -34,16 +34,13 @@ from mlflow.utils.file_utils import (
 )
 from mlflow.utils.model_utils import _get_all_flavor_configurations
 from mlflow.utils.nfs_on_spark import get_nfs_cache_root_dir
+from mlflow.utils.os import is_windows
 from mlflow.utils.process import ShellCommandException, cache_return_value_per_process
-from mlflow.utils.virtualenv import (
-    _get_or_create_virtualenv,
-    _get_pip_install_mlflow,
-)
+from mlflow.utils.virtualenv import _get_or_create_virtualenv
 from mlflow.version import VERSION
 
 _logger = logging.getLogger(__name__)
 
-_IS_UNIX = os.name != "nt"
 _STDIN_SERVER_SCRIPT = Path(__file__).parent.joinpath("stdin_server.py")
 
 # Flavors that require Java to be installed in the environment
@@ -57,6 +54,15 @@ FLAVOR_SPECIFIC_APT_PACKAGES = {
 
 # Directory to store loaded model inside the Docker context directory
 _MODEL_DIR_NAME = "model_dir"
+LOCAL_ENV_MANAGER_ERROR_MESSAGE = "We cannot use 'LOCAL' environment manager "
+"for your model configuration. Please specify a virtualenv or conda environment "
+"manager instead with `--env-manager` argument."
+
+
+def _set_mlflow_config_env(command_env, model_config):
+    if model_config:
+        command_env[scoring_server.SERVING_MODEL_CONFIG] = json.dumps(model_config)
+    return command_env
 
 
 class PyFuncBackend(FlavorBackend):
@@ -64,11 +70,11 @@ class PyFuncBackend(FlavorBackend):
     Flavor backend implementation for the generic python models.
     """
 
-    def __init__(
+    def __init__(  # noqa: D417
         self,
         config,
+        env_manager,
         workers=1,
-        env_manager=_EnvManager.VIRTUALENV,
         install_mlflow=False,
         create_env_root_dir=False,
         env_root_dir=None,
@@ -76,6 +82,9 @@ class PyFuncBackend(FlavorBackend):
     ):
         """
         Args:
+            env_manager: Environment manager to use for preparing the environment. If None,
+                MLflow will automatically pick the env manager based on the model's flavor
+                configuration for generate_dockerfile. It can't be None for other methods.
             env_root_dir: Root path for conda env. If None, use Conda's default environments
                 directory. Note if this is set, conda package cache path becomes
                 "{env_root_dir}/conda_cache_pkgs" instead of the global package cache
@@ -85,8 +94,11 @@ class PyFuncBackend(FlavorBackend):
         """
         super().__init__(config=config, **kwargs)
         self._nworkers = workers or 1
-        if env_manager == _EnvManager.CONDA and ENV not in config:
-            env_manager = _EnvManager.LOCAL
+        if env_manager == em.CONDA and ENV not in config:
+            warnings.warn(
+                "Conda environment is not specified in config `env`. Using local environment."
+            )
+            env_manager = em.LOCAL
         self._env_manager = env_manager
         self._install_mlflow = install_mlflow
         self._env_id = os.environ.get("MLFLOW_HOME", VERSION) if install_mlflow else None
@@ -94,7 +106,9 @@ class PyFuncBackend(FlavorBackend):
         self._env_root_dir = env_root_dir
         self._environment = None
 
-    def prepare_env(self, model_uri, capture_output=False, pip_requirements_override=None):
+    def prepare_env(
+        self, model_uri, capture_output=False, pip_requirements_override=None, extra_envs=None
+    ):
         if self._environment is not None:
             return self._environment
 
@@ -105,9 +119,9 @@ class PyFuncBackend(FlavorBackend):
             else:
                 root_tmp_dir = get_or_create_tmp_dir()
 
-            env_root_dir = os.path.join(root_tmp_dir, "envs")
-            os.makedirs(env_root_dir, exist_ok=True)
-            return env_root_dir
+            envs_root_dir = os.path.join(root_tmp_dir, "envs")
+            os.makedirs(envs_root_dir, exist_ok=True)
+            return envs_root_dir
 
         local_path = _download_artifact_from_uri(model_uri)
         if self._create_env_root_dir:
@@ -118,16 +132,17 @@ class PyFuncBackend(FlavorBackend):
         else:
             env_root_dir = self._env_root_dir
 
-        if self._env_manager == _EnvManager.VIRTUALENV:
+        if self._env_manager in {em.VIRTUALENV, em.UV}:
             activate_cmd = _get_or_create_virtualenv(
                 local_path,
                 self._env_id,
                 env_root_dir=env_root_dir,
                 capture_output=capture_output,
                 pip_requirements_override=pip_requirements_override,
+                env_manager=self._env_manager,
             )
-            self._environment = Environment(activate_cmd)
-        elif self._env_manager == _EnvManager.CONDA:
+            self._environment = Environment(activate_cmd, extra_env=extra_envs)
+        elif self._env_manager == em.CONDA:
             conda_env_path = os.path.join(local_path, _extract_conda_env(self._config[ENV]))
             self._environment = get_or_create_conda_env(
                 conda_env_path,
@@ -135,9 +150,10 @@ class PyFuncBackend(FlavorBackend):
                 capture_output=capture_output,
                 env_root_dir=env_root_dir,
                 pip_requirements_override=pip_requirements_override,
+                extra_envs=extra_envs,
             )
 
-        elif self._env_manager == _EnvManager.LOCAL:
+        elif self._env_manager == em.LOCAL:
             raise Exception("Prepare env should not be called with local env manager!")
         else:
             raise Exception(f"Unexpected env manager value '{self._env_manager}'")
@@ -156,6 +172,7 @@ class PyFuncBackend(FlavorBackend):
         output_path,
         content_type,
         pip_requirements_override=None,
+        extra_envs=None,
     ):
         """
         Generate predictions using generic python model saved with MLflow. The expected format of
@@ -167,7 +184,7 @@ class PyFuncBackend(FlavorBackend):
         # platform compatibility.
         local_uri = path_to_local_file_uri(local_path)
 
-        if self._env_manager != _EnvManager.LOCAL:
+        if self._env_manager != em.LOCAL:
             predict_cmd = [
                 "python",
                 _mlflow_pyfunc_backend_predict.__file__,
@@ -181,14 +198,16 @@ class PyFuncBackend(FlavorBackend):
             if output_path:
                 predict_cmd += ["--output-path", shlex.quote(str(output_path))]
 
-            if pip_requirements_override and self._env_manager == _EnvManager.CONDA:
+            if pip_requirements_override and self._env_manager == em.CONDA:
                 # Conda use = instead of == for version pinning
                 pip_requirements_override = [
-                    l.replace("==", "=") for l in pip_requirements_override
+                    pip_req.replace("==", "=") for pip_req in pip_requirements_override
                 ]
 
             environment = self.prepare_env(
-                local_path, pip_requirements_override=pip_requirements_override
+                local_path,
+                pip_requirements_override=pip_requirements_override,
+                extra_envs=extra_envs,
             )
 
             try:
@@ -217,6 +236,7 @@ class PyFuncBackend(FlavorBackend):
         synchronous=True,
         stdout=None,
         stderr=None,
+        model_config=None,
     ):
         """
         Serve pyfunc model locally.
@@ -227,6 +247,7 @@ class PyFuncBackend(FlavorBackend):
         command, command_env = server_implementation.get_cmd(
             local_path, port, host, timeout, self._nworkers
         )
+        _set_mlflow_config_env(command_env, model_config)
 
         if sys.platform.startswith("linux"):
 
@@ -260,7 +281,7 @@ class PyFuncBackend(FlavorBackend):
         else:
             setup_sigterm_on_parent_death = None
 
-        if _IS_UNIX:
+        if not is_windows():
             # Add "exec" before the starting scoring server command, so that the scoring server
             # process replaces the bash process, otherwise the scoring server process is created
             # as a child process of the bash process.
@@ -272,7 +293,7 @@ class PyFuncBackend(FlavorBackend):
             #  does not support prctl. We need to find an approach to address it.
             command = "exec " + command
 
-        if self._env_manager != _EnvManager.LOCAL:
+        if self._env_manager != em.LOCAL:
             return self.prepare_env(local_path).execute(
                 command,
                 command_env,
@@ -284,7 +305,7 @@ class PyFuncBackend(FlavorBackend):
         else:
             _logger.info("=== Running command '%s'", command)
 
-            if os.name != "nt":
+            if not is_windows():
                 command = ["bash", "-c", command]
 
             child_proc = subprocess.Popen(
@@ -310,10 +331,16 @@ class PyFuncBackend(FlavorBackend):
         model_uri,
         stdout=None,
         stderr=None,
+        model_config=None,
     ):
         local_path = _download_artifact_from_uri(model_uri)
+
+        command_env = os.environ.copy()
+        _set_mlflow_config_env(command_env, model_config)
+
         return self.prepare_env(local_path).execute(
             command=f"python {_STDIN_SERVER_SCRIPT} --model-uri {local_path}",
+            command_env=command_env,
             stdin=subprocess.PIPE,
             stdout=stdout,
             stderr=stderr,
@@ -321,7 +348,7 @@ class PyFuncBackend(FlavorBackend):
         )
 
     def can_score_model(self):
-        if self._env_manager == _EnvManager.LOCAL:
+        if self._env_manager == em.LOCAL:
             # noconda => already in python and dependencies are assumed to be installed.
             return True
         conda_path = get_conda_bin_executable("conda")
@@ -343,6 +370,7 @@ class PyFuncBackend(FlavorBackend):
         install_mlflow=False,
         mlflow_home=None,
         enable_mlserver=False,
+        base_image=None,
     ):
         with TempDir() as tmp:
             cwd = tmp.path()
@@ -353,6 +381,7 @@ class PyFuncBackend(FlavorBackend):
                 install_mlflow=install_mlflow,
                 mlflow_home=mlflow_home,
                 enable_mlserver=enable_mlserver,
+                base_image=base_image,
             )
 
             _logger.info("Building docker image with name %s", image_name)
@@ -366,6 +395,7 @@ class PyFuncBackend(FlavorBackend):
         install_mlflow=False,
         mlflow_home=None,
         enable_mlserver=False,
+        base_image=None,
     ):
         os.makedirs(output_dir, exist_ok=True)
         _logger.debug("Created all folders in path", extra={"output_directory": output_dir})
@@ -374,27 +404,38 @@ class PyFuncBackend(FlavorBackend):
             model_cwd = os.path.join(output_dir, _MODEL_DIR_NAME)
             pathlib.Path(model_cwd).mkdir(parents=True, exist_ok=True)
             model_path = _download_artifact_from_uri(model_uri, output_path=model_cwd)
-            base_image = self._get_base_image(model_path, install_java)
+            base_image = base_image or self._get_base_image(model_path, install_java)
+            env_manager = self._env_manager or em.LOCAL
 
-            # We don't need virtualenv or conda if base image is python
-            env_manager = (
-                _EnvManager.LOCAL if base_image.startswith("python") else self._env_manager
-            )
+            if base_image.startswith("python"):
+                # we can directly use local env for python image
+                if env_manager in [em.CONDA, em.VIRTUALENV]:
+                    # we can directly use ubuntu image for conda and virtualenv
+                    base_image = UBUNTU_BASE_IMAGE
+            elif base_image == UBUNTU_BASE_IMAGE:
+                env_manager = self._env_manager or em.VIRTUALENV
+                # installing python on ubuntu image is problematic and not recommended officially
+                # , so we recommend using conda or virtualenv instead on ubuntu image
+                if env_manager == em.LOCAL:
+                    raise MlflowException.invalid_parameter_value(LOCAL_ENV_MANAGER_ERROR_MESSAGE)
 
             model_install_steps = self._model_installation_steps(
                 model_path, env_manager, install_mlflow, enable_mlserver
             )
             entrypoint = f"from mlflow.models import container as C; C._serve('{env_manager}')"
 
+        # if no model_uri specified, user must use virtualenv or conda env based on ubuntu image
         else:
-            base_image = UBUNTU_BASE_IMAGE
+            base_image = base_image or UBUNTU_BASE_IMAGE
+            env_manager = self._env_manager or em.VIRTUALENV
+            if env_manager == em.LOCAL:
+                raise MlflowException.invalid_parameter_value(LOCAL_ENV_MANAGER_ERROR_MESSAGE)
+
             model_install_steps = ""
             # If model_uri is not specified, dependencies are installed at runtime
             entrypoint = (
-                self._get_install_pyfunc_deps_cmd(
-                    self._env_manager, install_mlflow, enable_mlserver
-                )
-                + f" C._serve('{self._env_manager}')"
+                self._get_install_pyfunc_deps_cmd(env_manager, install_mlflow, enable_mlserver)
+                + f" C._serve('{env_manager}')"
             )
 
         dockerfile_text = docker_utils.generate_dockerfile(
@@ -402,7 +443,7 @@ class PyFuncBackend(FlavorBackend):
             base_image=base_image,
             model_install_steps=model_install_steps,
             entrypoint=entrypoint,
-            env_manager=self._env_manager,
+            env_manager=env_manager,
             mlflow_home=mlflow_home,
             enable_mlserver=enable_mlserver,
             # always disable env creation at runtime for pyfunc
@@ -414,7 +455,7 @@ class PyFuncBackend(FlavorBackend):
         """
         Determine the base image to use for the Dockerfile.
 
-        We use Python slim base image when all of the following conditions are met:
+        We use Python slim base image when all the following conditions are met:
           1. Model URI is specified by the user
           2. Model flavor does not require Java
           3. Python version is specified in the model
@@ -435,18 +476,14 @@ class PyFuncBackend(FlavorBackend):
 
         # Get Python version from MLmodel
         try:
-            model_config_path = os.path.join(model_path, MLMODEL_FILE_NAME)
-            model = Model.load(model_config_path)
-
-            conf = model.flavors[pyfunc.FLAVOR_NAME]
-            env_conf = conf[pyfunc.ENV]
-            python_env_config_path = os.path.join(model_path, env_conf[_EnvManager.VIRTUALENV])
+            env_conf = Model.load(model_path).flavors[pyfunc.FLAVOR_NAME][pyfunc.ENV][em.VIRTUALENV]
+            python_env_config_path = os.path.join(model_path, env_conf)
 
             python_env = _PythonEnv.from_yaml(python_env_config_path)
             return PYTHON_SLIM_BASE_IMAGE.format(version=python_env.python)
         except Exception as e:
             _logger.warning(
-                f"Failed to determine Python version from {model_config_path}. "
+                f"Failed to determine Python version from {model_path}. "
                 f"Defaulting to {UBUNTU_BASE_IMAGE}. Error: {e}"
             )
             return UBUNTU_BASE_IMAGE
@@ -472,7 +509,7 @@ class PyFuncBackend(FlavorBackend):
         return steps
 
     def _get_install_pyfunc_deps_cmd(
-        self, env_manager: _EnvManager, install_mlflow: bool, enable_mlserver: bool
+        self, env_manager: str, install_mlflow: bool, enable_mlserver: bool
     ):
         return (
             "from mlflow.models import container as C; "

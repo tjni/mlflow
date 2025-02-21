@@ -1,15 +1,13 @@
-import { Button, CloseIcon, Typography, useDesignSystemTheme } from '@databricks/design-system';
 import type { MetricHistoryByName, RunInfoEntity } from '../../types';
 import {
   containsMultipleRunsTooltipData,
   RunsChartsTooltipMode,
   type RunsChartsTooltipBodyProps,
 } from '../runs-charts/hooks/useRunsChartsTooltip';
-import { getStableColorForRun } from '../../utils/RunNameUtils';
-import { isSystemMetricKey, normalizeChartMetricKey, normalizeMetricChartTooltipValue } from '../../utils/MetricsUtils';
+import { isSystemMetricKey } from '../../utils/MetricsUtils';
 import Utils from '../../../common/utils/Utils';
-import { FormattedMessage } from 'react-intl';
-import { first, isUndefined } from 'lodash';
+import { FormattedMessage, useIntl } from 'react-intl';
+import { isUndefined } from 'lodash';
 import type {
   RunsCompareMultipleTracesTooltipData,
   RunsMetricsSingleTraceTooltipData,
@@ -21,17 +19,18 @@ import { RunsMultipleTracesTooltipBody } from '../runs-charts/components/RunsMul
  * Tooltip body displayed when hovering over run view metric charts
  */
 export const RunViewChartTooltipBody = ({
-  contextData: { runInfo, metricsForRun },
+  contextData: { metricsForRun },
   hoverData,
   chartData: { metricKey },
   isHovering,
   mode,
 }: RunsChartsTooltipBodyProps<
-  { runInfo: RunInfoEntity; metricsForRun: MetricHistoryByName },
+  { metricsForRun: MetricHistoryByName },
   { metricKey: string },
   RunsMetricsBarPlotHoverData | RunsMetricsSingleTraceTooltipData | RunsCompareMultipleTracesTooltipData
 >) => {
   const singleTraceHoverData = containsMultipleRunsTooltipData(hoverData) ? hoverData.hoveredDataPoint : hoverData;
+  const intl = useIntl();
 
   if (
     mode === RunsChartsTooltipMode.MultipleTracesWithScanline &&
@@ -71,12 +70,12 @@ export const RunViewChartTooltipBody = ({
             />
             :
           </strong>{' '}
-          {Utils.formatTimestamp(timestamp)}
+          {Utils.formatTimestamp(timestamp, intl)}
         </div>
       )}
       {value && (
         <div css={styles.valueField}>
-          <strong>{metricKey}:</strong> {normalizeMetricChartTooltipValue(value)}
+          <strong>{metricKey}:</strong> {value}
         </div>
       )}
     </div>

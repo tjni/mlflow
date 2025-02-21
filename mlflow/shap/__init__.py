@@ -3,7 +3,7 @@ import tempfile
 import types
 import warnings
 from contextlib import contextmanager
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import numpy as np
 import yaml
@@ -48,8 +48,6 @@ _BASE_VALUES_FILE_NAME = "base_values.npy"
 _SHAP_VALUES_FILE_NAME = "shap_values.npy"
 _UNKNOWN_MODEL_FLAVOR = "unknown"
 _UNDERLYING_MODEL_SUBPATH = "underlying_model"
-
-model_data_artifact_paths = []
 
 
 def get_underlying_model_flavor(model):
@@ -168,8 +166,7 @@ def log_explanation(predict_function, features, artifact_path=None):
 
             .. code-block:: python
 
-                def predict_function(X) -> pred:
-                    ...
+                def predict_function(X) -> pred: ...
 
             - ``X``: An array-like object whose shape should be (# samples, # features).
             - ``pred``: An array-like object whose shape should be (# samples) for a regressor or
@@ -317,9 +314,7 @@ def log_explainer(
             Defaults to True. Currently MLflow serialization is only supported for models of
             'sklearn' or 'pytorch' flavors.
         conda_env: {{ conda_env }}
-        code_paths: A list of local filesystem paths to Python file dependencies (or directories
-            containing file dependencies). These files are *prepended* to the system path when the
-            model is loaded.
+        code_paths: {{ code_paths }}
         registered_model_name: If given, create a model version under ``registered_model_name``,
             also creating a registered model if one with the given name does not exist.
         signature: :py:class:`ModelSignature <mlflow.models.ModelSignature>` describes model input
@@ -341,13 +336,10 @@ def log_explainer(
             minutes. Specify 0 or None to skip waiting.
         pip_requirements: {{ pip_requirements }}
         extra_pip_requirements: {{ extra_pip_requirements }}
-        metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
-
-            .. Note:: Experimental: This parameter may change or be removed in a future
-                release without warning.
+        metadata: {{ metadata }}
     """
 
-    Model.log(
+    return Model.log(
         artifact_path=artifact_path,
         flavor=mlflow.shap,
         explainer=explainer,
@@ -393,9 +385,7 @@ def save_explainer(
             Defaults to True. Currently MLflow serialization is only supported for models of
             'sklearn' or 'pytorch' flavors.
         conda_env: {{ conda_env }}
-        code_paths: A list of local filesystem paths to Python file dependencies (or directories
-            containing file dependencies). These files are *prepended* to the system path when the
-            model is loaded.
+        code_paths: {{ code_paths }}
         mlflow_model: :py:mod:`mlflow.models.Model` this flavor is being added to.
         signature: :py:class:`ModelSignature <mlflow.models.ModelSignature>` describes model input
             and output :py:class:`Schema <mlflow.types.Schema>`. The model signature can be
@@ -413,10 +403,7 @@ def save_explainer(
         input_example: {{ input_example }}
         pip_requirements: {{ pip_requirements }}
         extra_pip_requirements: {{ extra_pip_requirements }}
-        metadata: Custom metadata dictionary passed to the model and stored in the MLmodel file.
-
-            .. Note:: Experimental: This parameter may change or be removed in a future
-                release without warning.
+        metadata: {{ metadata }}
     """
     import shap
 
@@ -664,18 +651,21 @@ class _SHAPWrapper:
 
         self.explainer = _load_explainer(explainer_file=shap_explainer_artifacts_path, model=model)
 
+    def get_raw_model(self):
+        """
+        Returns the underlying model.
+        """
+        return self.explainer
+
     def predict(
         self,
         dataframe,
-        params: Optional[Dict[str, Any]] = None,
+        params: Optional[dict[str, Any]] = None,
     ):
         """
         Args:
             dataframe: Model input data.
             params: Additional parameters to pass to the model for inference.
-
-                .. Note:: Experimental: This parameter may change or be removed in a future
-                    release without warning.
 
         Returns:
             Model predictions.

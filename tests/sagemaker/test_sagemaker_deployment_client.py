@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 from collections import namedtuple
 from functools import wraps
@@ -413,7 +414,9 @@ def test_update_deployment_with_serverless_config_when_endpoint_exists(
     configs = sagemaker_client.list_endpoint_configs()
     target_config = None
     for config in configs["EndpointConfigs"]:
-        if app_name in config["EndpointConfigName"]:
+        # NB: restricting the matching on the app_name due to truncation for
+        # a full randomized app_name exceeding the allowable character count of 63
+        if config["EndpointConfigName"].startswith(app_name[:8]):
             target_config = config
     if target_config is None:
         raise Exception("Endpoint config not found")
@@ -972,9 +975,10 @@ def test_create_deployment_throws_exception_after_endpoint_creation_fails(
             )
         return result
 
-    with mock.patch(
-        "botocore.client.BaseClient._make_api_call", new=fail_endpoint_creations
-    ), pytest.raises(MlflowException, match="deployment operation failed") as exc:
+    with (
+        mock.patch("botocore.client.BaseClient._make_api_call", new=fail_endpoint_creations),
+        pytest.raises(MlflowException, match="deployment operation failed") as exc,
+    ):
         sagemaker_deployment_client.create_deployment(
             name="test-app",
             model_uri=pretrained_model.model_uri,
@@ -1221,9 +1225,10 @@ def test_update_deployment_in_replace_mode_throws_exception_after_endpoint_updat
             )
         return result
 
-    with mock.patch(
-        "botocore.client.BaseClient._make_api_call", new=fail_endpoint_updates
-    ), pytest.raises(MlflowException, match="deployment operation failed") as exc:
+    with (
+        mock.patch("botocore.client.BaseClient._make_api_call", new=fail_endpoint_updates),
+        pytest.raises(MlflowException, match="deployment operation failed") as exc,
+    ):
         sagemaker_deployment_client.update_deployment(
             name=name,
             model_uri=pretrained_model.model_uri,
@@ -1308,7 +1313,7 @@ def test_update_deployment_in_replace_mode_with_archiving_does_not_delete_resour
     sk_model = mlflow.sklearn.load_model(model_uri=model_uri)
     new_artifact_path = "model"
     with mlflow.start_run():
-        mlflow.sklearn.log_model(sk_model=sk_model, artifact_path=new_artifact_path)
+        mlflow.sklearn.log_model(sk_model, new_artifact_path)
         new_model_uri = f"runs:/{mlflow.active_run().info.run_id}/{new_artifact_path}"
     sagemaker_deployment_client.update_deployment(
         name=name,
@@ -1528,6 +1533,9 @@ def test_get_deployment_successful(pretrained_model, sagemaker_client):
     endpoint_description = sagemaker_deployment_client.get_deployment(name)
 
     expected_description = sagemaker_client.describe_endpoint(EndpointName=name)
+    # The date header value in `expected_description` is occasionally one second ahead of
+    # `endpoint_description`. To avoid flakiness, use `mock.ANY` to match any value.
+    expected_description["ResponseMetadata"]["HTTPHeaders"]["date"] = mock.ANY
     assert endpoint_description == expected_description
 
 
@@ -1541,6 +1549,9 @@ def test_get_deployment_with_assumed_role_arn(
     endpoint_description = sagemaker_deployment_client.get_deployment(name)
 
     expected_description = sagemaker_client.describe_endpoint(EndpointName=name)
+    # The date header value in `expected_description` is occasionally one second ahead of
+    # `endpoint_description`. To avoid flakiness, use `mock.ANY` to match any value.
+    expected_description["ResponseMetadata"]["HTTPHeaders"]["date"] = mock.ANY
     assert endpoint_description == expected_description
 
 
@@ -1670,3 +1681,35 @@ def test_predict_with_array_input_output(sagemaker_deployment_client):
 
         assert isinstance(result, pd.DataFrame)
         assert list(result[0]) == [1, 2, 3]
+
+
+def test_truncate_name():
+    assert mfs._truncate_name("a" * 64, 63) == "a" * 30 + "---" + "a" * 30
+    assert mfs._truncate_name("a" * 10, 63) == "a" * 10
+    assert mfs._truncate_name("abcdefghijklmnopqrst", 10) == "abc---qrst"
+
+
+def test_get_sagemaker_model_name():
+    model_name = mfs._get_sagemaker_model_name("testEndpoint")
+    assert model_name.startswith("testEndpoint-model-")
+    assert len(model_name) <= 63
+
+
+def test_get_sagemaker_transform_model_name():
+    transform_name = mfs._get_sagemaker_transform_model_name("testJob")
+    assert transform_name.startswith("testJob-model-")
+    assert len(transform_name) <= 63
+
+
+# Test unique name generation with the specified suffix for config names
+def test_get_sagemaker_config_name():
+    config_name = mfs._get_sagemaker_config_name("testConfig")
+    assert config_name.startswith("testConfig-config-")
+    assert len(config_name) <= 63
+
+
+# Test the behavior when the base name is too long and needs truncation
+def test_name_truncation_for_long_base_name():
+    long_base_name = "a" * 100  # 100 characters long
+    model_name = mfs._get_sagemaker_model_name(long_base_name)
+    assert re.match(r"^aaaaaaaaaaaaaaaa---aaaaaaaaaaaaaaaaa-model-[0-9a-f]{20}$", model_name)

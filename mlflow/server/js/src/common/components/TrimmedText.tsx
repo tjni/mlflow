@@ -11,7 +11,7 @@ import { Button } from '@databricks/design-system';
 type Props = {
   text: string;
   maxSize: number;
-  className: string;
+  className?: string;
   allowShowMore?: boolean;
   dataTestId?: string;
 };
@@ -38,7 +38,7 @@ export const TrimmedText = ({ text, maxSize, className, allowShowMore = false, d
           onClick={() => setShowMore(!showMore)}
           size="small"
           css={styles.expandButton}
-          data-test-id="trimmed-text-button"
+          data-testid="trimmed-text-button"
         >
           {showMore ? 'collapse' : 'expand'}
         </Button>

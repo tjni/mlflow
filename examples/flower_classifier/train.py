@@ -3,6 +3,7 @@ Example of image classification with MLflow using Keras to classify flowers from
 taken from ``http://download.tensorflow.org/example_images/flower_photos.tgz`` and may be
 downloaded during running this project if it is missing.
 """
+
 import math
 import os
 import tarfile
@@ -86,7 +87,7 @@ def run(training_data, test_ratio, epochs, batch_size, image_width, image_height
     )
 
 
-class MLflowLogger(Callback):
+class MlflowLogger(Callback):
     """
     Keras callback for logging metrics and final model with MLflow.
 
@@ -174,12 +175,12 @@ def train(
     directly to image base64 encoded image data.
 
     Args:
-        image_height: Height of the input image in pixels.
-        image_width: Width of the input image in pixels.
         image_files: List of image files to be used for training.
         labels: List of labels for the image files.
         domain: Dictionary representing the domain of the response.
             Provides mapping label-name -> label-id.
+        image_width: Width of the input image in pixels.
+        image_height: Height of the input image in pixels.
         epochs: Number of epochs to train the model for.
         batch_size: Batch size used during training.
         test_ratio: Fraction of dataset to be used for validation. This data will not be used
@@ -225,7 +226,7 @@ def train(
                     epochs=epochs,
                     batch_size=batch_size,
                     callbacks=[
-                        MLflowLogger(
+                        MlflowLogger(
                             model=model,
                             x_train=x_train,
                             y_train=y_train,

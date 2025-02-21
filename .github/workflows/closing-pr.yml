@@ -10,9 +10,6 @@ defaults:
   run:
     shell: bash --noprofile --norc -exo pipefail {0}
 
-permissions:
-  contents: read
-
 jobs:
   closing-pr:
     runs-on: ubuntu-latest
@@ -23,11 +20,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          sparse-checkout: |
+            .github
       - uses: actions/github-script@v7
         with:
           script: |
             const script = require(
               `${process.env.GITHUB_WORKSPACE}/.github/workflows/closing-pr.js`
             );
-            script({ context, github });
+            await script({ context, github });
