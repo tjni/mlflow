@@ -1021,10 +1021,9 @@ def _has_h1_header(cells: list[dict[str, Any]]) -> bool:
     )
 
 
-def lint_file(path: Path, code: str, config: Config, index_path: Path) -> list[Violation]:
+def lint_file(path: Path, code: str, config: Config, index: SymbolIndex) -> list[Violation]:
     if path.is_absolute():
         raise ValueError(f"Path must be relative: {path}")
-    index = SymbolIndex.load(index_path)
     if path.suffix == ".ipynb":
         violations = []
         if cells := json.loads(code).get("cells"):
