@@ -6,7 +6,7 @@ import textwrap
 import tokenize
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, TypeAlias
+from typing import Any, Iterable, Iterator, TypeAlias
 
 from typing_extensions import Self
 
@@ -30,26 +30,28 @@ class DisableComment:
     column: int
     comment_line: int
 
+    @classmethod
+    def from_token(cls, token: tokenize.TokenInfo) -> list[Self]:
+        if not (m := DISABLE_COMMENT_REGEX.search(token.string)):
+            return []
+        is_next = m.group(1) is not None
+        comment_line = token.start[0] - 1
+        target_line = comment_line + 1 if is_next else comment_line
+        col = token.start[1] + m.start()
+        return [
+            cls(rule=rule.strip(), line=target_line, column=col, comment_line=comment_line)
+            for rule in m.group(2).split(",")
+        ]
 
-def parse_disable_comments(code: str) -> list[DisableComment]:
-    """Parses all `# clint: disable=` and `# clint: disable-next=` comments from source code."""
-    result: list[DisableComment] = []
-    readline = iter(code.splitlines(True)).__next__
-    for tok in tokenize.generate_tokens(readline):
-        if tok.type != tokenize.COMMENT:
-            continue
-        if m := DISABLE_COMMENT_REGEX.search(tok.string):
-            is_next = m.group(1) is not None
-            comment_line = tok.start[0] - 1
-            target_line = comment_line + 1 if is_next else comment_line
-            col = tok.start[1] + m.start()
-            result.extend(
-                DisableComment(
-                    rule=rule.strip(), line=target_line, column=col, comment_line=comment_line
-                )
-                for rule in m.group(2).split(",")
-            )
-    return result
+
+def parse_comments(code: str) -> tuple[list[DisableComment], list[Noqa]]:
+    disables: list[DisableComment] = []
+    noqas: list[Noqa] = []
+    for token in iter_comments(code):
+        disables.extend(DisableComment.from_token(token))
+        if noqa := Noqa.from_token(token):
+            noqas.append(noqa)
+    return disables, noqas
 
 
 HasLocation: TypeAlias = (
@@ -363,7 +365,7 @@ class Linter(ast.NodeVisitor):
         *,
         path: Path,
         config: Config,
-        disable_comments: list[DisableComment],
+        disables: list[DisableComment],
         index: SymbolIndex,
         cell: int | None = None,
         offset: Position | None = None,
@@ -374,7 +376,7 @@ class Linter(ast.NodeVisitor):
         Args:
             path: Path to the file being linted.
             config: Linter configuration declared within the pyproject.toml file.
-            disable_comments: All disable comments found in the source code.
+            disables: All disable comments found in the source code.
             index: Symbol index for resolving function signatures.
             cell: Index of the cell being linted in a Jupyter notebook.
             offset: Position offset to apply to the line and column numbers of the violations.
@@ -382,9 +384,9 @@ class Linter(ast.NodeVisitor):
         self.stack: list[ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef] = []
         self.path = path
         self.config = config
-        self.disable_comments = disable_comments
+        self.disables = disables
         self.ignore: dict[str, set[int]] = {}
-        for dc in disable_comments:
+        for dc in disables:
             self.ignore.setdefault(dc.rule, set()).add(dc.line)
         self.cell = cell
         self.violations: list[Violation] = []
@@ -532,18 +534,18 @@ class Linter(ast.NodeVisitor):
         except SyntaxError:
             return [Violation(rules.ExampleSyntaxError(), path, example.range)]
 
-        disable_comments = parse_disable_comments(example.code)
+        disables, noqas = parse_comments(example.code)
         # Only track disable comments for rules checked in examples
-        disable_comments = [dc for dc in disable_comments if dc.rule in config.example_rules]
+        disables = [dc for dc in disables if dc.rule in config.example_rules]
         linter = cls(
             path=path,
             config=config,
-            disable_comments=disable_comments,
+            disables=disables,
             index=index,
             offset=example.range.start,
         )
         linter.visit(tree)
-        linter.visit_comments(example.code)
+        linter.visit_noqas(noqas)
         if index:
             v = ExampleVisitor(linter, index)
             v.visit(tree)
@@ -919,17 +921,16 @@ class Linter(ast.NodeVisitor):
                 if range := self.lazy_modules.get(mod):
                     self._check(range, rules.LazyModule())
 
-        for dc in self.disable_comments:
+        for dc in self.disables:
             if (dc.rule, dc.line) not in self.used_disables:
                 self._check(
                     Range(Position(dc.comment_line, dc.column)),
                     rules.UnusedDisableComment(dc.rule),
                 )
 
-    def visit_comments(self, src: str) -> None:
-        for comment in iter_comments(src):
-            if noqa := Noqa.from_token(comment):
-                self.visit_noqa(noqa)
+    def visit_noqas(self, noqas: Iterable[Noqa]) -> None:
+        for noqa in noqas:
+            self.visit_noqa(noqa)
 
     def visit_noqa(self, noqa: Noqa) -> None:
         if rule := rules.DoNotDisable.check(noqa.rules):
@@ -988,15 +989,16 @@ def _lint_cell(
         # Ignore non-python cells such as `!pip install ...`
         return violations
 
+    disables, noqas = parse_comments(src)
     linter = Linter(
         path=path,
         config=config,
-        disable_comments=parse_disable_comments(src),
+        disables=disables,
         index=index,
         cell=cell_index,
     )
     linter.visit(tree)
-    linter.visit_comments(src)
+    linter.visit_noqas(noqas)
     linter.post_visit()
     violations.extend(linter.violations)
 
@@ -1055,15 +1057,16 @@ def lint_file(path: Path, code: str, config: Config, index: SymbolIndex) -> list
             violations.extend(Linter.visit_example(path, config, code_block, index))
         return violations
     else:
+        disables, noqas = parse_comments(code)
         linter = Linter(
             path=path,
             config=config,
-            disable_comments=parse_disable_comments(code),
+            disables=disables,
             index=index,
         )
         module = ast.parse(code)
         linter.visit(module)
-        linter.visit_comments(code)
+        linter.visit_noqas(noqas)
         linter.visit_file_content(code)
         linter.post_visit()
         return linter.violations
