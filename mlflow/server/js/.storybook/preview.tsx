@@ -6,7 +6,6 @@ import { withRouterDecorator } from './decorators/with-router';
 import { withReduxDecorator } from './decorators/with-redux';
 
 export const parameters = {
-  actions: { argTypesRegex: '^on[A-Z].*' },
   controls: {
     matchers: {
       color: /(background|color)$/i,
