@@ -6,7 +6,6 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   PlusIcon,
-  LinkIcon,
   Notification,
   Tooltip,
   useDesignSystemTheme,
@@ -135,14 +134,7 @@ export const ModelTraceExplorerDrawer = ({
                 />
               }
             >
-              <Button
-                componentId="mlflow.evaluations_review.modal.share-button"
-                icon={<LinkIcon />}
-                size="small"
-                type="tertiary"
-                onClick={handleShareClick}
-                css={{ flexShrink: 0 }}
-              >
+              <Button componentId="mlflow.evaluations_review.modal.share-button" onClick={handleShareClick}>
                 <FormattedMessage defaultMessage="Share" description="Label for the share trace button" />
               </Button>
             </Tooltip>
