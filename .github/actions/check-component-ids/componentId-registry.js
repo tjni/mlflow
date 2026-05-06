@@ -2097,6 +2097,7 @@ module.exports = {
   "shared.model-trace-explorer.key-value-tag.link": "",
   "shared.model-trace-explorer.linked_prompts.table.header": "",
   "shared.model-trace-explorer.linked_prompts.table.search": "",
+  "shared.model-trace-explorer.log-level-tooltip": "",
   "shared.model-trace-explorer.next-search-match": "",
   "shared.model-trace-explorer.prev-search-match": "",
   "shared.model-trace-explorer.relevance-assessment-tooltip": "",
