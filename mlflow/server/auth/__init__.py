@@ -1348,20 +1348,24 @@ def validate_can_view_roles():
 
 def validate_can_list_roles():
     """
-    Authorization for the ``/mlflow/roles/list`` endpoint. The endpoint accepts an
-    optional ``workspace`` param: if provided, returns roles in that workspace; if
-    omitted, returns all roles across workspaces. Non-admins must scope the request to
-    a workspace where they hold a role; only super admins can list across workspaces.
+    Authorization for the ``/mlflow/roles/list`` endpoint. The endpoint accepts a
+    repeated ``workspace`` query param: zero workspaces lists across the system
+    (admin-only), one or more scopes the listing to those workspaces. Non-admins
+    must hold a role in *every* workspace they request; only super admins can list
+    unscoped.
     """
     username = authenticate_request().username
     user = store.get_user(username)
     if user.is_admin:
         return True
-    params = _request_params()
-    workspace = params.get("workspace")
-    if not isinstance(workspace, str) or not workspace.strip():
+    requested = {
+        w.strip() for w in request.args.getlist("workspace") if isinstance(w, str) and w.strip()
+    }
+    if not requested:
         return False
-    return store.user_has_any_role_in_workspace(user.id, workspace)
+    # Single batch query — avoids N round-trips when multiple workspaces are
+    # requested and dedups duplicates implicitly via the set.
+    return requested <= store.list_user_present_workspaces(user.id)
 
 
 def validate_can_view_user_roles():
@@ -1466,13 +1470,20 @@ def validate_can_read_user():
 
 
 def validate_can_list_users():
-    # only admins can list all users, but admins won't reach this validator
-    return False
+    # Workspace admins are allowed: the payload has no per-workspace data, and
+    # they need all usernames to assign outsiders to roles in workspaces they manage.
+    # (Super admins short-circuit in ``_before_request`` and never reach this validator.)
+    user = store.get_user(authenticate_request().username)
+    return bool(store.list_workspace_admin_workspaces(user.id))
 
 
 def validate_can_create_user():
-    # only admins can create user, but admins won't reach this validator
-    return False
+    # Workspace admins may need to seed an account before assigning it a role
+    # in a workspace they manage; creating a user grants no access on its own.
+    # Deletion stays super-admin-only (see ``validate_can_delete_user``).
+    # (Super admins short-circuit in ``_before_request`` and never reach this validator.)
+    user = store.get_user(authenticate_request().username)
+    return bool(store.list_workspace_admin_workspaces(user.id))
 
 
 def validate_can_update_user_password():
@@ -2434,18 +2445,15 @@ def get_role():
 
 @catch_mlflow_exception
 def list_roles():
-    # Optional ``workspace`` scopes the listing. When omitted, fall back to cross-
+    # Repeated ``workspace`` scopes the listing. When omitted, fall back to cross-
     # workspace listing (admin-only — enforced by validate_can_list_roles).
-    params = _request_params()
-    workspace = params.get("workspace")
-    if workspace is None:
-        roles = store.list_all_roles()
-    else:
-        if not isinstance(workspace, str) or not workspace.strip():
+    workspaces = request.args.getlist("workspace")
+    for w in workspaces:
+        if not isinstance(w, str) or not w.strip():
             raise MlflowException.invalid_parameter_value(
                 "Parameter 'workspace' must be a non-empty string when provided."
             )
-        roles = store.list_roles(workspace)
+    roles = store.list_roles(workspaces) if workspaces else store.list_roles()
     return jsonify({"roles": [r.to_json() for r in roles]})
 
 
@@ -3210,10 +3218,32 @@ def get_user():
 
 @catch_mlflow_exception
 def list_users():
-    users = store.list_users()
-    return jsonify({
-        "users": [{"id": u.id, "username": u.username, "is_admin": u.is_admin} for u in users]
-    })
+    # Eager-load each user's roles in one batch so the admin Users tab doesn't
+    # have to fan out per-user requests. Per-user roles are scoped to what the
+    # caller is allowed to see, mirroring ``list_user_roles``:
+    # - super admin / self → every role
+    # - workspace admin → roles in workspaces they administer
+    users_with_roles = store.list_users_with_roles()
+    requester = authenticate_request().username
+    requester_user = store.get_user(requester)
+    admin_workspaces: set[str] | None = (
+        None
+        if requester_user.is_admin
+        else store.list_workspace_admin_workspaces(requester_user.id)
+    )
+    response_users = []
+    for u, roles in users_with_roles:
+        if admin_workspaces is None or u.username == requester:
+            visible_roles = roles
+        else:
+            visible_roles = [r for r in roles if r.workspace in admin_workspaces]
+        response_users.append({
+            "id": u.id,
+            "username": u.username,
+            "is_admin": u.is_admin,
+            "roles": [r.to_json() for r in visible_roles],
+        })
+    return jsonify({"users": response_users})
 
 
 @catch_mlflow_exception
