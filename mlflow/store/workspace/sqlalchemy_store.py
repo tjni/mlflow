@@ -129,7 +129,7 @@ class SqlAlchemyStore(AbstractStore):
                 workspace.trace_archival_retention,
             )
         )
-        with self.ManagedSessionMaker() as session:
+        with self.ManagedSessionMaker(read_only=False) as session:
             try:
                 entity = SqlWorkspace(
                     name=workspace.name,
@@ -166,7 +166,7 @@ class SqlAlchemyStore(AbstractStore):
             )
         )
 
-        with self.ManagedSessionMaker() as session:
+        with self.ManagedSessionMaker(read_only=False) as session:
             entity = self._get_workspace(session, workspace.name)
             if workspace.description is not None:
                 entity.description = workspace.description
@@ -203,7 +203,7 @@ class SqlAlchemyStore(AbstractStore):
                 INVALID_STATE,
             )
 
-        with self.ManagedSessionMaker() as session:
+        with self.ManagedSessionMaker(read_only=False) as session:
             entity = self._get_workspace(session, workspace_name)
             try:
                 if mode == WorkspaceDeletionMode.RESTRICT:

@@ -898,7 +898,7 @@ def test_workspace_startup_ignores_default_experiment_reserved_location(
     legacy_store.tracking_uri = db_uri
     legacy_store.artifact_root_uri = base_root.as_uri()
 
-    with legacy_store.ManagedSessionMaker() as session:
+    with legacy_store.ManagedSessionMaker(read_only=False) as session:
         default_exp = (
             session
             .query(SqlExperiment)
@@ -1010,7 +1010,7 @@ def test_trace_tag_operations_are_workspace_scoped(workspace_tracking_store):
     with WorkspaceContext("team-trace-a"):
         exp_a = workspace_tracking_store.create_experiment("exp-trace-a")
         trace_id_a = generate_request_id_v2()
-        with workspace_tracking_store.ManagedSessionMaker() as session:
+        with workspace_tracking_store.ManagedSessionMaker(read_only=False) as session:
             session.add(
                 SqlTraceInfo(
                     request_id=trace_id_a,
@@ -1035,7 +1035,7 @@ def test_search_traces_is_workspace_scoped(workspace_tracking_store):
     with WorkspaceContext("team-search-a"):
         exp_a = workspace_tracking_store.create_experiment("exp-search-a")
         trace_id_a = generate_request_id_v2()
-        with workspace_tracking_store.ManagedSessionMaker() as session:
+        with workspace_tracking_store.ManagedSessionMaker(read_only=False) as session:
             session.add(
                 SqlTraceInfo(
                     request_id=trace_id_a,
@@ -1049,7 +1049,7 @@ def test_search_traces_is_workspace_scoped(workspace_tracking_store):
     with WorkspaceContext("team-search-b"):
         exp_b = workspace_tracking_store.create_experiment("exp-search-b")
         trace_id_b = generate_request_id_v2()
-        with workspace_tracking_store.ManagedSessionMaker() as session:
+        with workspace_tracking_store.ManagedSessionMaker(read_only=False) as session:
             session.add(
                 SqlTraceInfo(
                     request_id=trace_id_b,
@@ -1075,7 +1075,7 @@ def test_link_traces_to_run_is_workspace_scoped(workspace_tracking_store):
         exp_a = workspace_tracking_store.create_experiment("exp-link-a")
         run_a = workspace_tracking_store.create_run(exp_a, "alice", _now_ms(), [], "run-a")
         trace_id_a = generate_request_id_v2()
-        with workspace_tracking_store.ManagedSessionMaker() as session:
+        with workspace_tracking_store.ManagedSessionMaker(read_only=False) as session:
             session.add(
                 SqlTraceInfo(
                     request_id=trace_id_a,
@@ -1090,7 +1090,7 @@ def test_link_traces_to_run_is_workspace_scoped(workspace_tracking_store):
         exp_b = workspace_tracking_store.create_experiment("exp-link-b")
         run_b = workspace_tracking_store.create_run(exp_b, "bob", _now_ms(), [], "run-b")
         trace_id_b = generate_request_id_v2()
-        with workspace_tracking_store.ManagedSessionMaker() as session:
+        with workspace_tracking_store.ManagedSessionMaker(read_only=False) as session:
             session.add(
                 SqlTraceInfo(
                     request_id=trace_id_b,
@@ -1134,7 +1134,7 @@ def test_assessment_operations_are_workspace_scoped(workspace_tracking_store):
     with WorkspaceContext("team-assessment-a"):
         exp_a = workspace_tracking_store.create_experiment("exp-assessment-a")
         trace_id_a = generate_request_id_v2()
-        with workspace_tracking_store.ManagedSessionMaker() as session:
+        with workspace_tracking_store.ManagedSessionMaker(read_only=False) as session:
             session.add(
                 SqlTraceInfo(
                     request_id=trace_id_a,
@@ -1162,7 +1162,7 @@ def test_assessment_operations_are_workspace_scoped(workspace_tracking_store):
     with WorkspaceContext("team-assessment-b"):
         exp_b = workspace_tracking_store.create_experiment("exp-assessment-b")
         trace_id_b = generate_request_id_v2()
-        with workspace_tracking_store.ManagedSessionMaker() as session:
+        with workspace_tracking_store.ManagedSessionMaker(read_only=False) as session:
             session.add(
                 SqlTraceInfo(
                     request_id=trace_id_b,
@@ -1198,7 +1198,7 @@ def test_create_assessment_validates_trace_workspace(workspace_tracking_store):
     with WorkspaceContext("team-create-a"):
         exp_a = workspace_tracking_store.create_experiment("exp-create-a")
         trace_id_a = generate_request_id_v2()
-        with workspace_tracking_store.ManagedSessionMaker() as session:
+        with workspace_tracking_store.ManagedSessionMaker(read_only=False) as session:
             session.add(
                 SqlTraceInfo(
                     request_id=trace_id_a,
@@ -1230,7 +1230,7 @@ def test_calculate_trace_filter_correlation_filters_experiment_ids(workspace_tra
         exp_a = workspace_tracking_store.create_experiment("exp-corr-a")
         for _ in range(5):
             trace_id = generate_request_id_v2()
-            with workspace_tracking_store.ManagedSessionMaker() as session:
+            with workspace_tracking_store.ManagedSessionMaker(read_only=False) as session:
                 session.add(
                     SqlTraceInfo(
                         request_id=trace_id,
@@ -1252,7 +1252,7 @@ def test_calculate_trace_filter_correlation_filters_experiment_ids(workspace_tra
         exp_b = workspace_tracking_store.create_experiment("exp-corr-b")
         for _ in range(3):
             trace_id = generate_request_id_v2()
-            with workspace_tracking_store.ManagedSessionMaker() as session:
+            with workspace_tracking_store.ManagedSessionMaker(read_only=False) as session:
                 session.add(
                     SqlTraceInfo(
                         request_id=trace_id,
@@ -1295,7 +1295,7 @@ def test_calculate_trace_filter_correlation_cross_workspace_ids_filtered(workspa
     with WorkspaceContext("team-xcorr-a"):
         exp_a = workspace_tracking_store.create_experiment("exp-xcorr-a")
         trace_id = generate_request_id_v2()
-        with workspace_tracking_store.ManagedSessionMaker() as session:
+        with workspace_tracking_store.ManagedSessionMaker(read_only=False) as session:
             session.add(
                 SqlTraceInfo(
                     request_id=trace_id,
@@ -1433,7 +1433,7 @@ def test_link_prompts_to_trace_is_workspace_scoped(workspace_tracking_store):
     with WorkspaceContext("team-prompt-a"):
         exp_a = workspace_tracking_store.create_experiment("exp-prompt-a")
         trace_id_a = generate_request_id_v2()
-        with workspace_tracking_store.ManagedSessionMaker() as session:
+        with workspace_tracking_store.ManagedSessionMaker(read_only=False) as session:
             session.add(
                 SqlTraceInfo(
                     request_id=trace_id_a,
